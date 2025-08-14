@@ -1,2 +1,4 @@
+from datetime import datetime
+
 def foo(param):
-  print(param)
+  print(f"Current time: {datetime.now()}")
