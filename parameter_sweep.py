@@ -1,147 +1,98 @@
 """
-Stimulation Parameter Sweep for the FinalSpark NeuroPlatform.
+Stimulation Parameter Sweep — NeuroPlatform / FinalSpark
+=========================================================
+Designed for remote execution via the Datalore API + GitHub integration.
 
-This script systematically sweeps over a configurable grid of stimulation
-parameters (amplitude, duration, polarity, …) across one or more electrodes,
-records when each stimulus was sent, and saves a summary CSV so that the
-results can later be correlated with spike data from the Spike-DB.
+HOW PARAMETERS ARE INJECTED
+-----------------------------
+The Datalore runner passes parameters in two ways, matching the API contract:
 
-Usage
------
-1.  Set TOKEN to the token that was provided to you by FinalSpark.
-2.  Edit SweepConfig to choose which electrodes and parameter ranges to test.
-3.  Run:
+    CLASS_PARAMETERS  -> passed as keyword arguments to __init__()
+    FUNCTION_PARAMETERS -> passed as keyword arguments to run()
 
-        # Full live experiment
-        python stim_sweep.py
+Example Datalore API payload:
 
-        # Test mode: connects to real hardware, uploads params, sends triggers
-        # but forces amplitude to 0 µA so no tissue is stimulated.
-        python stim_sweep.py --test
+    CLASS_PARAMETERS = '[
+        {"name": "token",            "value": "9T5KLS6T7X"},
+        {"name": "dry_run",          "value": false}
+    ]'
 
-        # Dry-run: no hardware connections at all, only logs what would happen.
-        python stim_sweep.py --dry-run
+    FUNCTION_PARAMETERS = '[
+        {"name": "electrode_indices", "value": [0, 8, 16]},
+        {"name": "amplitudes_uA",     "value": [1.0, 2.0, 4.0]},
+        {"name": "durations_us",      "value": [50.0, 100.0, 200.0]},
+        {"name": "polarities",        "value": ["NegativeFirst", "PositiveFirst"]},
+        {"name": "inter_stim_delay_s","value": 2.0},
+        {"name": "param_upload_wait_s","value": 12.0},
+        {"name": "output_csv",        "value": "sweep_results.csv"}
+    ]'
 
-Execution modes (mutually exclusive, in ascending order of hardware involvement)
----------------------------------------------------------------------------------
-dry_run   – No SDK calls whatsoever.  Pure logic / CSV output test.
-            Delays are skipped entirely.  Use this to validate the parameter
-            grid and output file before touching hardware.
+POLARITY VALUES
+---------------
+Pass polarities as strings — the class resolves them automatically:
+    "NegativeFirst"  ->  StimPolarity.NegativeFirst
+    "PositiveFirst"  ->  StimPolarity.PositiveFirst
 
-test_mode – Full hardware round-trip (Experiment, Intan, TriggerGenerator) with
-            real connections, parameter uploads, and triggers — but every
-            StimParam is sent with amplitude forced to 0 µA so that no actual
-            stimulation current flows through the tissue.  Delays are real.
-            Use this to verify hardware connectivity and timing end-to-end.
-
-(neither) – Normal live experiment.  Parameters and amplitudes are used as
-            configured.
+LOCAL / MANUAL TESTING
+-----------------------
+    sweep = StimParameterSweep(token="MY_TOKEN", dry_run=True)
+    sweep.run(amplitudes_uA=[1.0, 2.0], electrode_indices=[0, 8])
 """
 
 from __future__ import annotations
 
-import argparse
 import csv
 import itertools
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-
-# NeuroPlatform SDK
 from neuroplatform import Experiment, IntanSofware, StimParam, StimPolarity, Trigger
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logger
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-	level=logging.INFO,
+    level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
 
-# Amplitude sent to hardware when test_mode is active [µA].
-# Must be 0 so that no current flows, but a valid StimParam is still uploaded.
-_TEST_MODE_AMPLITUDE_uA: float = 0.0
+# ---------------------------------------------------------------------------
+# Polarity helper — accepts StimPolarity instances or plain strings
+# ---------------------------------------------------------------------------
+_POLARITY_MAP = {
+    "negativefirst": StimPolarity.NegativeFirst,
+    "positivefirst": StimPolarity.PositiveFirst,
+}
+
+
+def _resolve_polarity(value) -> StimPolarity:
+    if isinstance(value, StimPolarity):
+        return value
+    key = str(value).lower().replace(" ", "").replace("_", "")
+    if key not in _POLARITY_MAP:
+        raise ValueError(
+            f"Unknown polarity '{value}'. "
+            f"Valid strings: {list(_POLARITY_MAP.keys())}"
+        )
+    return _POLARITY_MAP[key]
 
 
 # ===========================================================================
-# Data classes – configuration and result records
+# Internal helpers
 # ===========================================================================
 
 
-@dataclass
-class SweepConfig:
-    """All user-configurable options for the parameter sweep."""
-
-    # ---- Experiment --------------------------------------------------------
-    token: str = "YOUR_TOKEN_HERE"
-
-    # ---- Electrodes to sweep -----------------------------------------------
-    # List of electrode indices (absolute index, 0-127).
-    # All electrodes share the same parameter grid; each gets its own trigger.
-    electrode_indices: List[int] = field(default_factory=lambda: [0, 8, 16])
-
-    # ---- Parameter grid ----------------------------------------------------
-    # Phase amplitudes [µA]
-    amplitudes_uA: List[float] = field(default_factory=lambda: [1.0, 2.0, 4.0])
-
-    # Phase durations [µs]  – both D1 and D2 are set to the same value so that
-    # the charge is always balanced (D1×A1 == D2×A2 when A1==A2).
-    durations_us: List[float] = field(default_factory=lambda: [50.0, 100.0, 200.0])
-
-    # Polarities to test
-    polarities: List[StimPolarity] = field(
-        default_factory=lambda: [StimPolarity.NegativeFirst, StimPolarity.PositiveFirst]
-    )
-
-    # ---- Timing ------------------------------------------------------------
-    # How long to wait between consecutive stimulus pulses (seconds)
-    inter_stim_delay_s: float = 2.0
-
-    # How long to wait after sending new parameters to Intan before firing
-    # (the API docs state that send_stimparam takes ~10 s to complete)
-    param_upload_wait_s: float = 12.0
-
-    # ---- Output ------------------------------------------------------------
-    output_csv: Path = Path("sweep_results.csv")
-
-    # ---- Safety limits -----------------------------------------------------
-    max_amplitude_uA: float = 10.0   # hard cap – never exceed this
-    max_duration_us: float = 1000.0  # hard cap – never exceed this
-
-
-@dataclass
-class SweepRecord:
-    """One row in the output CSV – a single stimulus event."""
-
-    timestamp_utc: str
-    electrode_index: int
-    trigger_key: int
-    amplitude_uA: float            # configured amplitude (may differ from what was sent)
-    effective_amplitude_uA: float  # amplitude actually sent to hardware
-    duration_us: float
-    polarity: str
-    tag: int                       # integer tag sent to Intan for DB lookup
-    execution_mode: str            # "live" | "test" | "dry_run"
-
-
-# ===========================================================================
-# Helper class – wraps a single stimulation configuration
-# ===========================================================================
-
-
-class StimConfiguration:
+class _StimConfiguration:
     """
-    Builds and owns a StimParam for a specific (electrode, amplitude,
-    duration, polarity) combination.
-
-    Charge balance is enforced: D1×A1 == D2×A2 with A1 == A2 → D1 == D2.
+    Builds a charge-balanced biphasic StimParam for one
+    (electrode, amplitude, duration, polarity) combination.
     """
 
     def __init__(
@@ -165,14 +116,12 @@ class StimConfiguration:
         p.index = self.electrode_index
         p.trigger_key = self.trigger_key
         p.polarity = self.polarity
-
-        # Balanced biphasic – same amplitude and duration for both phases
+        # Charge-balanced: D1*A1 == D2*A2  (A1==A2 => D1==D2)
         p.phase_amplitude1 = self.amplitude_uA
         p.phase_amplitude2 = self.amplitude_uA
         p.phase_duration1 = self.duration_us
         p.phase_duration2 = self.duration_us
-
-        # Standard safety / refractory settings
+        # Recommended refractory / safety defaults
         p.post_stim_ref_period = 1000.0
         p.enable_amp_settle = True
         p.post_stim_amp_settle = 1000.0
@@ -181,41 +130,28 @@ class StimConfiguration:
         return p
 
     def disabled_copy(self) -> StimParam:
-        """Return a copy of the underlying StimParam with enable=False."""
         p = StimParam()
         p.enable = False
         p.index = self.electrode_index
         p.trigger_key = self.trigger_key
         return p
 
-    def __repr__(self) -> str:
-        return (
-            f"StimConfiguration(electrode={self.electrode_index}, "
-            f"trigger={self.trigger_key}, "
-            f"amp={self.amplitude_uA}µA, "
-            f"dur={self.duration_us}µs, "
-            f"polarity={self.polarity})"
-        )
+
+@dataclass
+class _SweepRecord:
+    timestamp_utc: str
+    electrode_index: int
+    trigger_key: int
+    amplitude_uA: float
+    duration_us: float
+    polarity: str
+    tag: int
 
 
-# ===========================================================================
-# Result writer
-# ===========================================================================
-
-
-class SweepResultWriter:
-    """Incrementally writes SweepRecords to a CSV file."""
-
+class _SweepResultWriter:
     _FIELDS = [
-        "timestamp_utc",
-        "electrode_index",
-        "trigger_key",
-        "amplitude_uA",
-        "effective_amplitude_uA",
-        "duration_us",
-        "polarity",
-        "tag",
-        "execution_mode",
+        "timestamp_utc", "electrode_index", "trigger_key",
+        "amplitude_uA", "duration_us", "polarity", "tag",
     ]
 
     def __init__(self, path: Path) -> None:
@@ -223,22 +159,10 @@ class SweepResultWriter:
         self._file = open(path, "w", newline="", encoding="utf-8")
         self._writer = csv.DictWriter(self._file, fieldnames=self._FIELDS)
         self._writer.writeheader()
-        log.info("Results will be written to: %s", path.resolve())
+        log.info("Results CSV: %s", path.resolve())
 
-    def write(self, record: SweepRecord) -> None:
-        self._writer.writerow(
-            {
-                "timestamp_utc": record.timestamp_utc,
-                "electrode_index": record.electrode_index,
-                "trigger_key": record.trigger_key,
-                "amplitude_uA": record.amplitude_uA,
-                "effective_amplitude_uA": record.effective_amplitude_uA,
-                "duration_us": record.duration_us,
-                "polarity": record.polarity,
-                "tag": record.tag,
-                "execution_mode": record.execution_mode,
-            }
-        )
+    def write(self, record: _SweepRecord) -> None:
+        self._writer.writerow(record.__dict__)
         self._file.flush()
 
     def close(self) -> None:
@@ -247,300 +171,353 @@ class SweepResultWriter:
 
 
 # ===========================================================================
-# Main sweep class
+# Main class
 # ===========================================================================
 
 
 class StimParameterSweep:
     """
-    Orchestrates a full stimulation parameter sweep over the NeuroPlatform.
-
-    Call :py:meth:`run` to start the sweep.
+    Stimulation parameter sweep for the FinalSpark NeuroPlatform.
 
     Parameters
     ----------
-    config:
-        A :class:`SweepConfig` instance with all sweep settings.
-    dry_run:
-        When *True* the hardware connections are skipped and the script only
-        logs what it *would* do.  Useful for testing the parameter grid before
-        a real experiment.
+    All __init__ arguments map directly to CLASS_PARAMETERS entries.
+    All run() arguments map directly to FUNCTION_PARAMETERS entries.
+
+    __init__ (CLASS_PARAMETERS)
+    ----------------------------
+    token : str
+        Experiment token provided by FinalSpark.
+    dry_run : bool
+        True  -> log everything, never touch hardware (safe for testing).
+        False -> live experiment.
+    max_amplitude_uA : float
+        Hard safety cap on amplitude. Raises ValueError if exceeded.
+    max_duration_us : float
+        Hard safety cap on duration. Raises ValueError if exceeded.
+    param_upload_wait_s : float
+        Seconds to wait after send_stimparam(). Must be >= 10.0 (hardware limit).
+
+    run() (FUNCTION_PARAMETERS)
+    ----------------------------
+    electrode_indices : list[int]
+        Absolute electrode indices to stimulate (0-127). Max 16 electrodes.
+    amplitudes_uA : list[float]
+        Amplitude values to sweep [uA].
+    durations_us : list[float]
+        Phase duration values to sweep [us] — applied to both D1 and D2
+        to keep stimulations charge-balanced.
+    polarities : list[str | StimPolarity]
+        Polarity values to sweep. Accepted strings: "NegativeFirst",
+        "PositiveFirst".
+    inter_stim_delay_s : float
+        Pause between consecutive trigger fires [seconds].
+    output_csv : str
+        File path for the results CSV.
     """
 
-    # The Intan supports triggers 0-15.  We reserve one trigger per electrode.
-    MAX_TRIGGERS = 16
+    _MAX_TRIGGERS: int = 16
+
+    # ------------------------------------------------------------------
+    # Constructor  <-  CLASS_PARAMETERS
+    # ------------------------------------------------------------------
 
     def __init__(
-        self, config: Optional[SweepConfig] = None, dry_run: bool = False
+        self,
+        token: str = "YOUR_TOKEN_HERE",
+        dry_run: bool = True,
+        max_amplitude_uA: float = 10.0,
+        max_duration_us: float = 1000.0,
+        param_upload_wait_s: float = 12.0,
     ) -> None:
-        self.config = config or SweepConfig()
+        self.token = token
         self.dry_run = dry_run
+        self.max_amplitude_uA = max_amplitude_uA
+        self.max_duration_us = max_duration_us
+        self.param_upload_wait_s = param_upload_wait_s
 
-        self._validate_config()
-
-        # Hardware handles – initialised in run()
+        # Internal state
         self._exp: Optional[Experiment] = None
         self._intan: Optional[IntanSofware] = None
         self._trigger_gen: Optional[Trigger] = None
-
-        # Result writer
-        self._writer = SweepResultWriter(self.config.output_csv)
-
-        # Running tag counter (used as an integer tag in Intan, starts at 1)
+        self._writer: Optional[_SweepResultWriter] = None
         self._tag_counter: int = 1
 
     # ------------------------------------------------------------------
-    # Public entry point
+    # Entry point  <-  FUNCTION_PARAMETERS
     # ------------------------------------------------------------------
 
-    def run(self) -> None:
+    def run(
+        self,
+        electrode_indices: List[int] = None,
+        amplitudes_uA: List[float] = None,
+        durations_us: List[float] = None,
+        polarities: List = None,
+        inter_stim_delay_s: float = 2.0,
+        output_csv: str = "sweep_results.csv",
+    ) -> None:
         """
-        Execute the full parameter sweep.
+        Execute the full stimulation parameter sweep.
 
-        This is the single entry point to run the experiment.
+        All arguments correspond 1-to-1 with FUNCTION_PARAMETERS entries.
+        Defaults are used for any parameter not supplied by the caller.
         """
-        log.info("=== NeuroPlatform Stimulation Parameter Sweep ===")
-        log.info("Dry-run mode: %s", self.dry_run)
+        # Apply defaults here (avoids mutable default argument pitfall)
+        electrode_indices = electrode_indices if electrode_indices is not None else [0, 8, 16]
+        amplitudes_uA     = amplitudes_uA     if amplitudes_uA     is not None else [1.0, 2.0, 4.0]
+        durations_us      = durations_us      if durations_us      is not None else [50.0, 100.0, 200.0]
+        polarities        = polarities        if polarities        is not None else ["NegativeFirst", "PositiveFirst"]
 
-        combos = self._build_parameter_grid()
-        total = len(combos)
+        # Resolve polarity strings -> StimPolarity enum values
+        resolved_polarities: List[StimPolarity] = [
+            _resolve_polarity(p) for p in polarities
+        ]
+
+        log.info("=" * 60)
+        log.info("NeuroPlatform  —  Stimulation Parameter Sweep")
+        log.info("Token:    %s", self.token)
+        log.info("Dry-run:  %s", self.dry_run)
+        log.info("=" * 60)
+
+        self._validate(electrode_indices, amplitudes_uA, durations_us)
+
+        grid = self._build_grid(electrode_indices, amplitudes_uA, durations_us, resolved_polarities)
         log.info(
-            "Parameter grid: %d electrodes × %d combos = %d total stimulations",
-            len(self.config.electrode_indices),
-            total // len(self.config.electrode_indices),
-            total,
+            "Grid: %d electrodes x %d combos = %d total stimulations",
+            len(electrode_indices),
+            len(amplitudes_uA) * len(durations_us) * len(resolved_polarities),
+            len(grid),
         )
 
+        self._writer = _SweepResultWriter(Path(output_csv))
+        self._tag_counter = 1  # reset between runs
+
         if not self.dry_run:
-            self._connect_hardware()
+            self._connect()
 
         try:
-            self._run_sweep(combos)
+            self._sweep(grid, inter_stim_delay_s)
         finally:
             self._teardown()
 
-        log.info("Sweep complete.  Results saved to: %s", self.config.output_csv)
+        log.info("Sweep complete. Results: %s", Path(output_csv).resolve())
 
     # ------------------------------------------------------------------
-    # Private helpers
+    # Validation
     # ------------------------------------------------------------------
 
-    def _validate_config(self) -> None:
-        """Raise ValueError for obviously unsafe or impossible configurations."""
-        cfg = self.config
-
-        if not cfg.electrode_indices:
+    def _validate(
+        self,
+        electrode_indices: List[int],
+        amplitudes_uA: List[float],
+        durations_us: List[float],
+    ) -> None:
+        if not electrode_indices:
             raise ValueError("electrode_indices must not be empty.")
-
-        n_electrodes = len(cfg.electrode_indices)
-        if n_electrodes > self.MAX_TRIGGERS:
+        if len(electrode_indices) > self._MAX_TRIGGERS:
             raise ValueError(
-                f"Too many electrodes ({n_electrodes}); "
-                f"max is {self.MAX_TRIGGERS} (one trigger per electrode)."
+                f"Too many electrodes ({len(electrode_indices)}); "
+                f"max is {self._MAX_TRIGGERS}."
             )
-
-        for amp in cfg.amplitudes_uA:
-            if amp > cfg.max_amplitude_uA:
+        if len(set(electrode_indices)) != len(electrode_indices):
+            raise ValueError("Duplicate values in electrode_indices.")
+        for amp in amplitudes_uA:
+            if amp > self.max_amplitude_uA:
                 raise ValueError(
-                    f"Amplitude {amp} µA exceeds safety limit {cfg.max_amplitude_uA} µA."
+                    f"Amplitude {amp} uA exceeds safety cap {self.max_amplitude_uA} uA."
                 )
-
-        for dur in cfg.durations_us:
-            if dur > cfg.max_duration_us:
+        for dur in durations_us:
+            if dur > self.max_duration_us:
                 raise ValueError(
-                    f"Duration {dur} µs exceeds safety limit {cfg.max_duration_us} µs."
+                    f"Duration {dur} us exceeds safety cap {self.max_duration_us} us."
                 )
-
-        if len(set(cfg.electrode_indices)) != len(cfg.electrode_indices):
-            raise ValueError("Duplicate electrode indices found in electrode_indices.")
-
+        if self.param_upload_wait_s < 10.0:
+            raise ValueError("param_upload_wait_s must be >= 10.0 s (hardware limit).")
         log.info("Configuration validated OK.")
 
-    def _build_parameter_grid(
+    # ------------------------------------------------------------------
+    # Parameter grid
+    # ------------------------------------------------------------------
+
+    def _build_grid(
         self,
+        electrode_indices: List[int],
+        amplitudes_uA: List[float],
+        durations_us: List[float],
+        polarities: List[StimPolarity],
     ) -> List[tuple]:
-        """
-        Return a flat list of (electrode_index, trigger_key, amp, dur, polarity)
-        tuples representing every combination to test.
-
-        The trigger_key is assigned by position in electrode_indices so that
-        each electrode always uses the same trigger throughout the sweep.
-        """
-        electrode_trigger_pairs = [
-            (idx, trigger)
-            for trigger, idx in enumerate(self.config.electrode_indices)
-        ]
-
-        param_combos = list(
-            itertools.product(
-                self.config.amplitudes_uA,
-                self.config.durations_us,
-                self.config.polarities,
-            )
-        )
-
+        electrode_trigger_map = {
+            idx: trig for trig, idx in enumerate(electrode_indices)
+        }
         grid = []
-        for amp, dur, pol in param_combos:
-            for elec_idx, trig_key in electrode_trigger_pairs:
-                grid.append((elec_idx, trig_key, amp, dur, pol))
-
+        for amp, dur, pol in itertools.product(amplitudes_uA, durations_us, polarities):
+            for elec_idx in electrode_indices:
+                grid.append(
+                    (elec_idx, electrode_trigger_map[elec_idx], amp, dur, pol)
+                )
         return grid
 
-    def _connect_hardware(self) -> None:
-        """Open connections to Experiment, Intan and TriggerGenerator."""
-        log.info("Connecting to NeuroPlatform hardware …")
-        self._exp = Experiment(self.config.token)
+    # ------------------------------------------------------------------
+    # Hardware
+    # ------------------------------------------------------------------
+
+    def _connect(self) -> None:
+        log.info("Connecting to NeuroPlatform hardware ...")
+        self._exp = Experiment(self.token)
         self._intan = IntanSofware()
         self._trigger_gen = Trigger()
-        log.info("Hardware connections established.")
+        log.info("Hardware connected.")
 
-    def _run_sweep(self, combos: List[tuple]) -> None:
-        """
-        Core sweep loop.
+    # ------------------------------------------------------------------
+    # Core sweep loop
+    # ------------------------------------------------------------------
 
-        The combos list is grouped by (amp, dur, polarity) so that all
-        electrodes sharing the same parameters are uploaded together in a
-        single 10-second Intan round-trip.  This dramatically reduces
-        total experiment time.
-        """
-        cfg = self.config
-
-        # Start experiment (non-dry-run only)
+    def _sweep(self, grid: List[tuple], inter_stim_delay_s: float) -> None:
         if not self.dry_run:
             if not self._exp.start():
-                raise RuntimeError("Failed to start experiment – another may be running.")
+                raise RuntimeError(
+                    "Could not start experiment — another may already be running."
+                )
             log.info("Experiment started.")
 
-        # Group combos by parameter set (amp, dur, polarity)
-        # Each group contains all electrodes for that parameter combination.
+        # Group by (amp, dur, pol) to minimise 10-second Intan round-trips
         groups: dict = {}
-        for elec_idx, trig_key, amp, dur, pol in combos:
-            key = (amp, dur, pol)
-            groups.setdefault(key, []).append((elec_idx, trig_key))
+        for elec_idx, trig_key, amp, dur, pol in grid:
+            groups.setdefault((amp, dur, pol), []).append((elec_idx, trig_key))
 
-        total_groups = len(groups)
-        log.info("Uploading %d unique parameter sets to Intan.", total_groups)
-
-        for group_num, ((amp, dur, pol), elec_trig_pairs) in enumerate(
-            groups.items(), start=1
-        ):
+        total = len(groups)
+        for group_num, ((amp, dur, pol), pairs) in enumerate(groups.items(), 1):
             log.info(
-                "Group %d/%d — amp=%.1f µA  dur=%.0f µs  polarity=%s  "
-                "electrodes=%s",
-                group_num,
-                total_groups,
-                amp,
-                dur,
-                pol,
-                [e for e, _ in elec_trig_pairs],
+                "Group %d/%d  amp=%.1f uA  dur=%.0f us  polarity=%s  electrodes=%s",
+                group_num, total, amp, dur, pol, [e for e, _ in pairs],
             )
 
-            # Build one StimConfiguration per electrode for this parameter set
-            stim_configs = [
-                StimConfiguration(
-                    electrode_index=elec_idx,
-                    trigger_key=trig_key,
-                    amplitude_uA=amp,
-                    duration_us=dur,
-                    polarity=pol,
-                )
-                for elec_idx, trig_key in elec_trig_pairs
+            configs = [
+                _StimConfiguration(elec_idx, trig_key, amp, dur, pol)
+                for elec_idx, trig_key in pairs
             ]
 
-            # Upload parameters to Intan (takes ~10 s)
-            self._upload_params([sc.param for sc in stim_configs])
+            self._upload([sc.param for sc in configs])
 
-            # Fire each electrode individually so we get one record per stim
-            for sc in stim_configs:
-                self._fire_single(sc, amp, dur, pol)
-                time.sleep(cfg.inter_stim_delay_s)
+            for sc in configs:
+                self._fire(sc, amp, dur, pol)
+                time.sleep(inter_stim_delay_s)
 
-            # Disable all params in this group before moving to the next set
-            self._upload_params([sc.disabled_copy() for sc in stim_configs])
+            self._upload([sc.disabled_copy() for sc in configs])
 
-        log.info("All parameter groups completed.")
+        log.info("All groups completed.")
 
-    def _upload_params(self, params: List[StimParam]) -> None:
-        """Send a list of StimParams to the Intan software."""
+    # ------------------------------------------------------------------
+    # Intan helpers
+    # ------------------------------------------------------------------
+
+    def _upload(self, params: List[StimParam]) -> None:
         if self.dry_run:
-            log.debug("[DRY-RUN] Would upload %d StimParam(s) to Intan.", len(params))
+            log.debug("[DRY-RUN] Would upload %d StimParam(s).", len(params))
             return
-
-        log.debug("Uploading %d param(s) to Intan (waiting ~%ds) …",
-                  len(params), int(self.config.param_upload_wait_s))
+        log.debug("Uploading %d param(s) -> waiting %.0f s ...", len(params), self.param_upload_wait_s)
         self._intan.send_stimparam(params)
-        time.sleep(self.config.param_upload_wait_s)
+        time.sleep(self.param_upload_wait_s)
 
-    def _fire_single(
+    def _fire(
         self,
-        sc: StimConfiguration,
+        sc: _StimConfiguration,
         amp: float,
         dur: float,
         pol: StimPolarity,
     ) -> None:
-        """Send a single trigger for the given StimConfiguration and log it."""
         tag = self._tag_counter
         self._tag_counter += 1
         ts = datetime.now(tz=timezone.utc).isoformat()
 
         log.info(
-            "  FIRE  electrode=%d  trigger=%d  amp=%.1f µA  dur=%.0f µs  "
-            "polarity=%s  tag=%d",
-            sc.electrode_index,
-            sc.trigger_key,
-            amp,
-            dur,
-            pol,
-            tag,
+            "  FIRE  electrode=%-3d  trigger=%-2d  amp=%5.1f uA  dur=%6.1f us  polarity=%s  tag=%d",
+            sc.electrode_index, sc.trigger_key, amp, dur, pol, tag,
         )
 
         if not self.dry_run:
-            # Tag the trigger so it can be retrieved from the Spike-DB later
             self._intan.set_tag_trigger(tag)
-
             trigger_array = np.zeros(16, dtype=np.uint8)
             trigger_array[sc.trigger_key] = 1
             self._trigger_gen.send(trigger_array)
 
-        record = SweepRecord(
-            timestamp_utc=ts,
-            electrode_index=sc.electrode_index,
-            trigger_key=sc.trigger_key,
-            amplitude_uA=amp,
-            duration_us=dur,
-            polarity=str(pol),
-            tag=tag,
+        self._writer.write(
+            _SweepRecord(
+                timestamp_utc=ts,
+                electrode_index=sc.electrode_index,
+                trigger_key=sc.trigger_key,
+                amplitude_uA=amp,
+                duration_us=dur,
+                polarity=str(pol),
+                tag=tag,
+            )
         )
-        self._writer.write(record)
+
+    # ------------------------------------------------------------------
+    # Teardown
+    # ------------------------------------------------------------------
 
     def _teardown(self) -> None:
-        """Gracefully close all hardware connections."""
-        log.info("Tearing down …")
-        self._writer.close()
+        log.info("Tearing down ...")
+
+        if self._writer:
+            self._writer.close()
 
         if self.dry_run:
             log.info("[DRY-RUN] No hardware to close.")
             return
 
-        # Always re-enable variable threshold and stop the experiment
         try:
             self._intan.var_threshold(True)
         except Exception as exc:
             log.warning("Could not re-enable variable threshold: %s", exc)
-
         try:
             self._trigger_gen.close()
         except Exception as exc:
-            log.warning("Could not close TriggerGenerator: %s", exc)
-
+            log.warning("TriggerGenerator close failed: %s", exc)
         try:
             self._intan.close()
         except Exception as exc:
-            log.warning("Could not close Intan: %s", exc)
-
+            log.warning("Intan close failed: %s", exc)
         try:
             self._exp.stop()
         except Exception as exc:
-            log.warning("Could not stop experiment: %s", exc)
+            log.warning("Experiment stop failed: %s", exc)
 
         log.info("Hardware teardown complete.")
+
+
+# ===========================================================================
+# Datalore API usage reference
+# ===========================================================================
+#
+# CLASS_PARAMETERS = '[
+#     {"name": "token",               "value": "9T5KLS6T7X"},
+#     {"name": "dry_run",             "value": false},
+#     {"name": "max_amplitude_uA",    "value": 10.0},
+#     {"name": "max_duration_us",     "value": 1000.0},
+#     {"name": "param_upload_wait_s", "value": 12.0}
+# ]'
+#
+# FUNCTION_PARAMETERS = '[
+#     {"name": "electrode_indices",    "value": [0, 8, 16]},
+#     {"name": "amplitudes_uA",        "value": [1.0, 2.0, 4.0]},
+#     {"name": "durations_us",         "value": [50.0, 100.0, 200.0]},
+#     {"name": "polarities",           "value": ["NegativeFirst", "PositiveFirst"]},
+#     {"name": "inter_stim_delay_s",   "value": 2.0},
+#     {"name": "output_csv",           "value": "sweep_results.csv"}
+# ]'
+#
+# ===========================================================================
+# Local / manual testing
+# ===========================================================================
+#
+#   sweep = StimParameterSweep(token="9T5KLS6T7X", dry_run=True)
+#   sweep.run(
+#       electrode_indices=[0, 8],
+#       amplitudes_uA=[1.0, 2.0],
+#       durations_us=[100.0],
+#       polarities=["NegativeFirst"],
+#   )
+#
+# ===========================================================================
