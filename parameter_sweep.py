@@ -7,24 +7,29 @@ HOW PARAMETERS ARE INJECTED
 -----------------------------
 The Datalore runner passes parameters in two ways, matching the API contract:
 
-    CLASS_PARAMETERS  -> passed as keyword arguments to __init__()
+    CLASS_PARAMETERS    -> passed as keyword arguments to __init__()
     FUNCTION_PARAMETERS -> passed as keyword arguments to run()
 
 Example Datalore API payload:
 
     CLASS_PARAMETERS = '[
-        {"name": "token",            "value": "9T5KLS6T7X"},
-        {"name": "dry_run",          "value": false}
+        {"name": "token",               "value": "9T5KLS6T7X"},
+        {"name": "dry_run",             "value": false},
+        {"name": "max_amplitude_uA",    "value": 10.0},
+        {"name": "max_duration_us",     "value": 1000.0},
+        {"name": "param_upload_wait_s", "value": 12.0}
     ]'
 
     FUNCTION_PARAMETERS = '[
-        {"name": "electrode_indices", "value": [0, 8, 16]},
-        {"name": "amplitudes_uA",     "value": [1.0, 2.0, 4.0]},
-        {"name": "durations_us",      "value": [50.0, 100.0, 200.0]},
-        {"name": "polarities",        "value": ["NegativeFirst", "PositiveFirst"]},
-        {"name": "inter_stim_delay_s","value": 2.0},
-        {"name": "param_upload_wait_s","value": 12.0},
-        {"name": "output_csv",        "value": "sweep_results.csv"}
+        {"name": "electrode_indices",    "value": [0, 8, 16]},
+        {"name": "amplitudes_uA",        "value": [1.0, 2.0, 4.0]},
+        {"name": "durations_us",         "value": [50.0, 100.0, 200.0]},
+        {"name": "polarities",           "value": ["NegativeFirst", "PositiveFirst"]},
+        {"name": "inter_stim_delay_s",   "value": 2.0},
+        {"name": "param_upload_wait_s",  "value": 12.0},
+        {"name": "output_csv",           "value": "sweep_results.csv"},
+        {"name": "triggers_csv",         "value": "sweep_triggers.csv"},
+        {"name": "activity_csv",         "value": "sweep_activity.csv"}
     ]'
 
 POLARITY VALUES
@@ -32,6 +37,13 @@ POLARITY VALUES
 Pass polarities as strings — the class resolves them automatically:
     "NegativeFirst"  ->  StimPolarity.NegativeFirst
     "PositiveFirst"  ->  StimPolarity.PositiveFirst
+
+OUTPUT FILES
+------------
+After every run, three files are saved:
+    output_csv   — one row per trigger fired (amplitude, duration, polarity, tag, timestamp)
+    triggers_csv — raw trigger log retrieved from the Spike-DB for the experiment window
+    activity_csv — spike events retrieved from the Spike-DB for the experiment window
 
 LOCAL / MANUAL TESTING
 -----------------------
@@ -46,12 +58,13 @@ import itertools
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
-from neuroplatform import Experiment, IntanSofware, StimParam, StimPolarity, Trigger
+import pandas as pd
+from neuroplatform import Database, Experiment, IntanSofware, StimParam, StimPolarity, Trigger
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -179,6 +192,10 @@ class StimParameterSweep:
     """
     Stimulation parameter sweep for the FinalSpark NeuroPlatform.
 
+    After the sweep finishes, trigger and spike-event data for the full
+    experiment window are automatically fetched from the Spike-DB and saved
+    as separate CSV files (via pandas DataFrames).
+
     Parameters
     ----------
     All __init__ arguments map directly to CLASS_PARAMETERS entries.
@@ -213,7 +230,11 @@ class StimParameterSweep:
     inter_stim_delay_s : float
         Pause between consecutive trigger fires [seconds].
     output_csv : str
-        File path for the results CSV.
+        File path for the per-stimulation results CSV.
+    triggers_csv : str
+        File path for the DB trigger log CSV saved after the sweep.
+    activity_csv : str
+        File path for the DB spike-event CSV saved after the sweep.
     """
 
     _MAX_TRIGGERS: int = 16
@@ -243,6 +264,12 @@ class StimParameterSweep:
         self._writer: Optional[_SweepResultWriter] = None
         self._tag_counter: int = 1
 
+        # Timestamps recorded during run() to bound DB queries
+        self._exp_start_utc: Optional[datetime] = None
+        self._exp_stop_utc: Optional[datetime] = None
+        # FS organoid name derived from the Experiment token (e.g. "fs300")
+        self._fs_name: Optional[str] = None
+
     # ------------------------------------------------------------------
     # Entry point  <-  FUNCTION_PARAMETERS
     # ------------------------------------------------------------------
@@ -255,14 +282,17 @@ class StimParameterSweep:
         polarities: List = None,
         inter_stim_delay_s: float = 2.0,
         output_csv: str = "sweep_results.csv",
+        triggers_csv: str = "sweep_triggers.csv",
+        activity_csv: str = "sweep_activity.csv",
     ) -> None:
         """
-        Execute the full stimulation parameter sweep.
+        Execute the full stimulation parameter sweep, then fetch and save
+        trigger and spike-event data from the Spike-DB.
 
         All arguments correspond 1-to-1 with FUNCTION_PARAMETERS entries.
         Defaults are used for any parameter not supplied by the caller.
         """
-        # Apply defaults here (avoids mutable default argument pitfall)
+        # Apply defaults (avoids mutable default argument pitfall)
         electrode_indices = electrode_indices if electrode_indices is not None else [0, 8, 16]
         amplitudes_uA     = amplitudes_uA     if amplitudes_uA     is not None else [1.0, 2.0, 4.0]
         durations_us      = durations_us      if durations_us      is not None else [50.0, 100.0, 200.0]
@@ -290,7 +320,7 @@ class StimParameterSweep:
         )
 
         self._writer = _SweepResultWriter(Path(output_csv))
-        self._tag_counter = 1  # reset between runs
+        self._tag_counter = 1
 
         if not self.dry_run:
             self._connect()
@@ -300,7 +330,18 @@ class StimParameterSweep:
         finally:
             self._teardown()
 
-        log.info("Sweep complete. Results: %s", Path(output_csv).resolve())
+        # -- Post-run: fetch DB records and save as DataFrames ---------------
+        self._save_db_results(
+            triggers_csv=Path(triggers_csv),
+            activity_csv=Path(activity_csv),
+        )
+
+        log.info("=" * 60)
+        log.info("All outputs saved:")
+        log.info("  Stimulation log : %s", Path(output_csv).resolve())
+        log.info("  DB triggers     : %s", Path(triggers_csv).resolve())
+        log.info("  DB activity     : %s", Path(activity_csv).resolve())
+        log.info("=" * 60)
 
     # ------------------------------------------------------------------
     # Validation
@@ -358,15 +399,16 @@ class StimParameterSweep:
         return grid
 
     # ------------------------------------------------------------------
-    # Hardware
+    # Hardware connection
     # ------------------------------------------------------------------
 
     def _connect(self) -> None:
         log.info("Connecting to NeuroPlatform hardware ...")
         self._exp = Experiment(self.token)
+        self._fs_name = self._exp.exp_name   # e.g. "fs300" — used for DB queries
         self._intan = IntanSofware()
         self._trigger_gen = Trigger()
-        log.info("Hardware connected.")
+        log.info("Hardware connected. FS name: %s", self._fs_name)
 
     # ------------------------------------------------------------------
     # Core sweep loop
@@ -378,7 +420,10 @@ class StimParameterSweep:
                 raise RuntimeError(
                     "Could not start experiment — another may already be running."
                 )
-            log.info("Experiment started.")
+
+        # Record the experiment start time (UTC) for the DB query window
+        self._exp_start_utc = datetime.now(tz=timezone.utc)
+        log.info("Experiment started at %s UTC", self._exp_start_utc.isoformat())
 
         # Group by (amp, dur, pol) to minimise 10-second Intan round-trips
         groups: dict = {}
@@ -405,7 +450,9 @@ class StimParameterSweep:
 
             self._upload([sc.disabled_copy() for sc in configs])
 
-        log.info("All groups completed.")
+        # Record the experiment stop time (UTC) for the DB query window
+        self._exp_stop_utc = datetime.now(tz=timezone.utc)
+        log.info("Experiment finished at %s UTC", self._exp_stop_utc.isoformat())
 
     # ------------------------------------------------------------------
     # Intan helpers
@@ -415,7 +462,10 @@ class StimParameterSweep:
         if self.dry_run:
             log.debug("[DRY-RUN] Would upload %d StimParam(s).", len(params))
             return
-        log.debug("Uploading %d param(s) -> waiting %.0f s ...", len(params), self.param_upload_wait_s)
+        log.debug(
+            "Uploading %d param(s) -> waiting %.0f s ...",
+            len(params), self.param_upload_wait_s,
+        )
         self._intan.send_stimparam(params)
         time.sleep(self.param_upload_wait_s)
 
@@ -486,6 +536,137 @@ class StimParameterSweep:
 
         log.info("Hardware teardown complete.")
 
+    # ------------------------------------------------------------------
+    # Post-run DB retrieval
+    # ------------------------------------------------------------------
+
+    def _save_db_results(
+        self,
+        triggers_csv: Path,
+        activity_csv: Path,
+    ) -> None:
+        """
+        Query the Spike-DB for the experiment window and save two DataFrames:
+
+            triggers_csv  — all trigger events (db.get_all_triggers)
+            activity_csv  — all spike events   (db.get_spike_event)
+
+        In dry-run mode, empty placeholder DataFrames are saved so downstream
+        code always has files to read regardless of mode.
+        """
+        log.info("Fetching DB results for experiment window ...")
+
+        if self.dry_run or self._exp_start_utc is None or self._exp_stop_utc is None:
+            log.info(
+                "[DRY-RUN] No live experiment window — saving empty placeholder DataFrames."
+            )
+            self._save_empty_db_placeholders(triggers_csv, activity_csv)
+            return
+
+        # Add a small buffer on each side so we don't clip edge events
+        query_start = self._exp_start_utc - timedelta(seconds=5)
+        query_stop  = self._exp_stop_utc  + timedelta(seconds=5)
+
+        log.info(
+            "DB query window: %s -> %s (FS name: %s)",
+            query_start.isoformat(),
+            query_stop.isoformat(),
+            self._fs_name,
+        )
+
+        db = Database()
+
+        # ---- Triggers -------------------------------------------------------
+        self._fetch_and_save_triggers(db, query_start, query_stop, triggers_csv)
+
+        # ---- Spike events (activity) ----------------------------------------
+        self._fetch_and_save_activity(db, query_start, query_stop, activity_csv)
+
+    def _fetch_and_save_triggers(
+        self,
+        db: Database,
+        start: datetime,
+        stop: datetime,
+        path: Path,
+    ) -> None:
+        """
+        Fetch trigger events from the DB and save to CSV.
+
+        Columns returned by db.get_all_triggers:
+            Time, trigger, status, tag
+        """
+        try:
+            log.info("Querying triggers from DB ...")
+            triggers_df: pd.DataFrame = db.get_all_triggers(start, stop)
+
+            if triggers_df is None or triggers_df.empty:
+                log.warning("No trigger records returned by DB for this window.")
+                triggers_df = pd.DataFrame(columns=["Time", "trigger", "status", "tag"])
+            else:
+                log.info("Retrieved %d trigger record(s).", len(triggers_df))
+
+            triggers_df.to_csv(path, index=False)
+            log.info("Triggers saved -> %s", path.resolve())
+
+        except Exception as exc:
+            log.error("Failed to fetch/save triggers: %s", exc)
+            # Save an empty file so callers always find the path
+            pd.DataFrame(columns=["Time", "trigger", "status", "tag"]).to_csv(
+                path, index=False
+            )
+
+    def _fetch_and_save_activity(
+        self,
+        db: Database,
+        start: datetime,
+        stop: datetime,
+        path: Path,
+    ) -> None:
+        """
+        Fetch spike events from the DB and save to CSV.
+
+        Columns returned by db.get_spike_event:
+            Time, channel, amplitude
+        """
+        try:
+            log.info("Querying spike events from DB ...")
+            activity_df: pd.DataFrame = db.get_spike_event(start, stop, self._fs_name)
+
+            if activity_df is None or activity_df.empty:
+                log.warning("No spike event records returned by DB for this window.")
+                activity_df = pd.DataFrame(columns=["Time", "channel", "amplitude"])
+            else:
+                log.info(
+                    "Retrieved %d spike event(s) across %d unique channel(s).",
+                    len(activity_df),
+                    activity_df["channel"].nunique(),
+                )
+
+            activity_df.to_csv(path, index=False)
+            log.info("Activity saved -> %s", path.resolve())
+
+        except Exception as exc:
+            log.error("Failed to fetch/save activity: %s", exc)
+            pd.DataFrame(columns=["Time", "channel", "amplitude"]).to_csv(
+                path, index=False
+            )
+
+    def _save_empty_db_placeholders(
+        self,
+        triggers_csv: Path,
+        activity_csv: Path,
+    ) -> None:
+        """Save empty DataFrames with the correct schema for dry-run mode."""
+        pd.DataFrame(columns=["Time", "trigger", "status", "tag"]).to_csv(
+            triggers_csv, index=False
+        )
+        log.info("Empty triggers placeholder saved -> %s", triggers_csv.resolve())
+
+        pd.DataFrame(columns=["Time", "channel", "amplitude"]).to_csv(
+            activity_csv, index=False
+        )
+        log.info("Empty activity placeholder saved -> %s", activity_csv.resolve())
+
 
 # ===========================================================================
 # Datalore API usage reference
@@ -500,12 +681,14 @@ class StimParameterSweep:
 # ]'
 #
 # FUNCTION_PARAMETERS = '[
-#     {"name": "electrode_indices",    "value": [0, 8, 16]},
-#     {"name": "amplitudes_uA",        "value": [1.0, 2.0, 4.0]},
-#     {"name": "durations_us",         "value": [50.0, 100.0, 200.0]},
-#     {"name": "polarities",           "value": ["NegativeFirst", "PositiveFirst"]},
-#     {"name": "inter_stim_delay_s",   "value": 2.0},
-#     {"name": "output_csv",           "value": "sweep_results.csv"}
+#     {"name": "electrode_indices",   "value": [0, 8, 16]},
+#     {"name": "amplitudes_uA",       "value": [1.0, 2.0, 4.0]},
+#     {"name": "durations_us",        "value": [50.0, 100.0, 200.0]},
+#     {"name": "polarities",          "value": ["NegativeFirst", "PositiveFirst"]},
+#     {"name": "inter_stim_delay_s",  "value": 2.0},
+#     {"name": "output_csv",          "value": "sweep_results.csv"},
+#     {"name": "triggers_csv",        "value": "sweep_triggers.csv"},
+#     {"name": "activity_csv",        "value": "sweep_activity.csv"}
 # ]'
 #
 # ===========================================================================
@@ -518,6 +701,9 @@ class StimParameterSweep:
 #       amplitudes_uA=[1.0, 2.0],
 #       durations_us=[100.0],
 #       polarities=["NegativeFirst"],
+#       output_csv="sweep_results.csv",
+#       triggers_csv="sweep_triggers.csv",
+#       activity_csv="sweep_activity.csv",
 #   )
 #
 # ===========================================================================
