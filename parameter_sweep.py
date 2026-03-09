@@ -64,7 +64,7 @@ from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-from neuroplatform import Database, Experiment, IntanSofware, StimParam, StimPolarity, Trigger
+from neuroplatform import Database, Experiment, IntanSofware, StimParam, StimPolarity, TriggerController
 
 # ---------------------------------------------------------------------------
 # Logger
