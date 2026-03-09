@@ -596,11 +596,21 @@ class StimScan:
                 stimulations are sent to hardware. Defaults to False.
         """
         self.testing = testing
+        # FIX 1: store token and booking_email as instance attributes so
+        # _connect() (and save_results() in live mode) can access them.
+        self.token = token
+        self.booking_email = booking_email
+
+        # FIX 2: create a LogHistory on StimScan itself so _connect() and
+        # other methods can call self.log without AttributeError.
+        self.log = LogHistory(verbose=True)
+
         if self.testing:
-            print(
+            self.log.info(
                 "[TESTING MODE] No stimulations will be sent. "
                 "Parameter generation and timing logic will still execute."
             )
+
         self.parameter_grid = StimParamGrid(
             amplitudes=amplitudes,
             durations=durations,
@@ -622,20 +632,30 @@ class StimScan:
         self.start_time = None
         self.stop_time = None
 
+        # FIX 3: initialise hardware handles to None so that any path that
+        # checks self._intan / self.fs_experiment won't raise AttributeError
+        # when running in testing mode.
+        self.fs_experiment = None
+        self._trigger_gen = None
+        # FIX 4: set self._intan to None here; _make_parameters() passes it
+        # to StimParamLoader, which accepts None gracefully (warns but
+        # continues), so testing mode works without real hardware.
+        self._intan = None
+
         if not self.testing:
             self._connect()
-        
+
+            if not np.all(np.isin(scan_channels, self.fs_experiment.electrodes)):
+                raise ValueError(
+                    "Some channels are not in the allowed electrodes list for your experiment token."
+                )
+
         self._db = Database()
 
         self._channels_per_trigger: dict = {}
         self._current_factory_id = None
         self._stim_history: OrderedDict = OrderedDict()
         self._params_per_site: dict = {}
-
-        if not np.all(np.isin(scan_channels, self.fs_experiment.electrodes)):
-            raise ValueError(
-                "Some channels are not in the allowed electrodes list for your experiment token."
-            )
 
         for channel in scan_channels:
             site = Site.get_from_electrode(channel)
@@ -703,20 +723,25 @@ class StimScan:
         and no parameters are uploaded to hardware.
         """
         try:
-            if self.fs_experiment.start():
-                self.start_time = datetime.now(UTC)
-                for factory_id in tqdm(self.parameters):
-                    self._current_factory_id = factory_id
-                    self._make_parameters()
-                    self._send_stim()
+            if not self.testing:
+                if not self.fs_experiment.start():
+                    raise RuntimeError("Experiment did not start properly.")
+
+            self.start_time = datetime.now(UTC)
+            for factory_id in tqdm(self.parameters):
+                self._current_factory_id = factory_id
+                self._make_parameters()
+                self._send_stim()
         finally:
-            if self.loaders is not None and not self.testing:
-                for _, loader in self.loaders:
-                    loader.disable_all_and_send()
-            self._trigger_gen.close()
-            self._intan.close()
-            self.fs_experiment.stop()
+            if not self.testing:
+                if self.loaders is not None:
+                    for _, loader in self.loaders:
+                        loader.disable_all_and_send()
+                self._trigger_gen.close()
+                self._intan.close()
+                self.fs_experiment.stop()
             self.stop_time = datetime.now(UTC)
+            self.save_results()
 
     # ------------------------------------------------------------------
     # Save results
@@ -730,9 +755,9 @@ class StimScan:
         * ``stim_history.csv``   - stimulation parameter log recorded during
           the run (local, no DB query needed).
         * ``spike_activity.csv`` - spike events for the run window via
-          ``db.get_spike_event``.
+          ``db.get_spike_event``. Skipped in testing mode (no experiment name).
         * ``triggers.csv``       - trigger records for the run window via
-          ``db.get_all_triggers``.
+          ``db.get_all_triggers``. Skipped in testing mode (no experiment name).
 
         Args:
             output_dir: str
@@ -754,15 +779,25 @@ class StimScan:
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
         saved_paths: dict[str, Path] = {}
-        exp_name = self.fs_experiment.exp_name
 
-        # 1. Stimulation history (local) -------------------------------------
+        # 1. Stimulation history (local — always available) ------------------
         stim_history_path = out / "stim_history.csv"
         stim_df = self.get_stimulation_parameter_history()
         stim_df.index.name = "timestamp_utc"
         stim_df.to_csv(stim_history_path)
         saved_paths["stim_history"] = stim_history_path
         print(f"Saved stimulation history  -> {stim_history_path}")
+
+        # FIX 5: fs_experiment is None in testing mode, so guard DB queries
+        # that depend on exp_name behind a testing check.
+        if self.testing:
+            self.log.warning(
+                "Testing mode: skipping DB queries for spike activity and triggers "
+                "(no live experiment was run)."
+            )
+            return saved_paths
+
+        exp_name = self.fs_experiment.exp_name
 
         # 2. Spike activity --------------------------------------------------
         activity_path = out / "spike_activity.csv"
@@ -793,12 +828,14 @@ class StimScan:
     # ------------------------------------------------------------------
 
     def _connect(self) -> None:
+        """Connect to NeuroPlatform hardware. Only called in live mode."""
         self.log.info("Connecting to NeuroPlatform hardware ...")
+        # FIX 1 (continued): uses self.token and self.booking_email which are
+        # now properly stored as instance attributes in __init__.
         self.fs_experiment = Experiment(token=self.token)
-        self._fs_name = self.fs_experiment.exp_name   # e.g. "fs300" — used for DB queries
         self._trigger_gen = TriggerController(self.booking_email)
         self._intan = IntanSoftware()
-        self.log.info("Hardware connected. FS name: %s", self._fs_name)
+        self.log.info("Hardware connected. FS name: %s", self.fs_experiment.exp_name)
 
     def _get_param_indices_by_trigger(self, trigger_key: int, loader: StimParamLoader) -> list[int]:
         return [p.index for p in loader.stimparams if p.trigger_key == trigger_key]
@@ -849,7 +886,9 @@ class StimScan:
         """Build loader objects for the current factory.
 
         In testing mode loaders are still created for validation purposes,
-        but ``send_parameters`` is not called.
+        but ``send_parameters`` is not called. self._intan is None in testing
+        mode; StimParamLoader accepts this and issues a warning rather than
+        raising, so parameter building still completes successfully.
         """
         factory = self.parameters[self._current_factory_id]
         triggers_counter = np.zeros(16)
