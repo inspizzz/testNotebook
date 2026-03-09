@@ -276,10 +276,11 @@ class StimParameterSweep:
 
     def run(
         self,
-        electrode_indices: List[int] = None,
-        amplitudes_uA: List[float] = None,
-        durations_us: List[float] = None,
-        polarities: List = None,
+        electrode_indices: List[int],
+        amplitudes_uA: List[float],
+        durations_us: List[float],
+        polarities: List,
+        booking_email,
         inter_stim_delay_s: float = 2.0,
         output_csv: str = "sweep_results.csv",
         triggers_csv: str = "sweep_triggers.csv",
@@ -407,7 +408,7 @@ class StimParameterSweep:
         self._exp = Experiment(self.token)
         self._fs_name = self._exp.exp_name   # e.g. "fs300" — used for DB queries
         self._intan = IntanSofware()
-        self._trigger_gen = Trigger()
+        self._trigger_gen = TriggerController(self.booking_email)
         log.info("Hardware connected. FS name: %s", self._fs_name)
 
     # ------------------------------------------------------------------
