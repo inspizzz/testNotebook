@@ -245,13 +245,15 @@ class StimParameterSweep:
 
     def __init__(
         self,
-        token: str = "YOUR_TOKEN_HERE",
+        token,
+        booking_email,
         dry_run: bool = True,
         max_amplitude_uA: float = 10.0,
         max_duration_us: float = 1000.0,
         param_upload_wait_s: float = 12.0,
     ) -> None:
         self.token = token
+        self.booking_email = booking_email
         self.dry_run = dry_run
         self.max_amplitude_uA = max_amplitude_uA
         self.max_duration_us = max_duration_us
@@ -280,7 +282,6 @@ class StimParameterSweep:
         amplitudes_uA: List[float],
         durations_us: List[float],
         polarities: List,
-        booking_email,
         inter_stim_delay_s: float = 2.0,
         output_csv: str = "sweep_results.csv",
         triggers_csv: str = "sweep_triggers.csv",
