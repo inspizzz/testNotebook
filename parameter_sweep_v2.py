@@ -601,8 +601,6 @@ class StimScan:
                 "[TESTING MODE] No stimulations will be sent. "
                 "Parameter generation and timing logic will still execute."
             )
-
-        self.fs_experiment = Experiment(token=token)
         self.parameter_grid = StimParamGrid(
             amplitudes=amplitudes,
             durations=durations,
@@ -624,8 +622,9 @@ class StimScan:
         self.start_time = None
         self.stop_time = None
 
-        self._trigger_gen = TriggerController(booking_email)
-        self._intan = IntanSoftware()
+        if not self.testing:
+            self._connect()
+        
         self._db = Database()
 
         self._channels_per_trigger: dict = {}
@@ -792,6 +791,14 @@ class StimScan:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _connect(self) -> None:
+        self.log.info("Connecting to NeuroPlatform hardware ...")
+        self.fs_experiment = Experiment(token=self.token)
+        self._fs_name = self.fs_experiment.exp_name   # e.g. "fs300" — used for DB queries
+        self._trigger_gen = TriggerController(self.booking_email)
+        self._intan = IntanSoftware()
+        self.log.info("Hardware connected. FS name: %s", self._fs_name)
 
     def _get_param_indices_by_trigger(self, trigger_key: int, loader: StimParamLoader) -> list[int]:
         return [p.index for p in loader.stimparams if p.trigger_key == trigger_key]
