@@ -1,21 +1,25 @@
 from time import sleep
 from datetime import datetime, timedelta, UTC
-import numpy as np
+from typing import List
 from collections import OrderedDict
-import pandas as pd
-from tqdm import tqdm
 from dataclasses import dataclass, asdict, field
 from enum import Enum
 from itertools import product
 from pathlib import Path
+import logging
+from sys import stdout as STDOUT
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
 
 from neuroplatform import (
     Database,
     TriggerController,
     StimParam,
+    StimShape,
     Experiment,
     StimPolarity,
-    StimShape,
 )
 
 try:
@@ -26,35 +30,63 @@ except ImportError:
     except ImportError:
         raise ImportError("No IntanSoftware or IntanSofware")
 
-from .parameters_loader import StimParamLoader
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+_log = logging.getLogger(__name__)
+_log.setLevel(logging.INFO)
+_log.propagate = False
+
+if not _log.handlers:
+    _handler = logging.StreamHandler(STDOUT)
+    _handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
+    _log.addHandler(_handler)
 
 
-class ExtendedTimedelta(timedelta):
-    """Minimal extension of the timedelta class to add simple time unit conversion methods."""
+# ---------------------------------------------------------------------------
+# LogHistory
+# ---------------------------------------------------------------------------
 
-    def as_minutes(self) -> float:
-        """Returns the total number of minutes."""
-        return self.total_seconds() / 60
+class LogHistory:
+    """Manages log messages and exposes them as a DataFrame.
 
-    def as_seconds(self) -> float:
-        """Returns the total number of seconds."""
-        return self.total_seconds()
+    Args:
+        verbose (bool): If True, INFO-level messages are printed. Defaults to True.
+    """
 
-    def as_milliseconds(self) -> float:
-        """Returns the total number of milliseconds."""
-        return self.total_seconds() * 1e3
+    def __init__(self, verbose: bool = True):
+        self._history: OrderedDict = OrderedDict()
+        self.logger = _log
+        self.verbose = verbose
 
-    def as_microseconds(self) -> float:
-        """Returns the total number of microseconds."""
-        return self.total_seconds() * 1e6
+    def info(self, message: str):
+        self._history[datetime.now(UTC)] = ("INFO", message)
+        if self.verbose:
+            self.logger.info(message)
 
-    def to_hertz(self) -> float:
-        """Returns the frequency in hertz."""
-        if self.total_seconds() == 0:
-            print("Period is zero. Returning np.inf Hz.")
-            return np.inf
-        return 1 / self.total_seconds()
+    def warning(self, message: str):
+        self._history[datetime.now(UTC)] = ("WARNING", message)
+        self.logger.warning(message)
 
+    def error(self, message: str):
+        self._history[datetime.now(UTC)] = ("ERROR", message)
+        self.logger.error(message)
+
+    def debug(self, message: str):
+        self._history[datetime.now(UTC)] = ("DEBUG", message)
+        self.logger.debug(message)
+
+    def get_history(self) -> pd.DataFrame:
+        return pd.DataFrame.from_dict(
+            self._history, orient="index", columns=["Level", "Message"]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shared enums
+# ---------------------------------------------------------------------------
 
 class MEAType(Enum):
     """Layout of the MEA."""
@@ -67,20 +99,18 @@ class MEAType(Enum):
             return 4
         elif self == MEAType.MEA32:
             return 1
-        else:
-            raise ValueError("MEA type not recognized.")
+        raise ValueError("MEA type not recognized.")
 
     def get_electrodes_per_site(self) -> int:
         if self == MEAType.MEA4x8:
             return 8
         elif self == MEAType.MEA32:
             return 32
-        else:
-            raise ValueError("MEA type not recognized.")
+        raise ValueError("MEA type not recognized.")
 
 
 class MEA(Enum):
-    """MEA Number"""
+    """MEA number (0-indexed)."""
 
     One = 0
     Two = 1
@@ -97,17 +127,292 @@ class MEA(Enum):
 
 
 class Site(Enum):
-    """Neurosphere site ID, from 1 to 4"""
+    """Neurosphere site ID (0-indexed, 0-3)."""
 
     One = 0
     Two = 1
     Three = 2
     Four = 3
 
-    def get_from_electrode(electrode_id: int):
+    @staticmethod
+    def get_from_electrode(electrode_id: int) -> "Site":
         site = (electrode_id % 32) // 8
         return Site(site)
 
+
+# ---------------------------------------------------------------------------
+# StimParamLoader
+# ---------------------------------------------------------------------------
+
+class StimParamLoader:
+    """Manages stimulation parameters and sends them to the Intan software.
+
+    Args:
+        stimparams (List[StimParam] | None): List of stimulation parameters.
+        intan (IntanSoftware, optional): Intan software instance. Defaults to None.
+        verbose (bool, optional): If True, display log messages. Defaults to True.
+        must_connect (bool, optional): Raise if Intan is not connected. Defaults to False.
+
+    Methods:
+        add_stimparam(stimparam): Append a StimParam to the list.
+        enable_all(): Enable all parameters.
+        disable_all(): Disable all parameters.
+        send_parameters(): Send parameters to the Intan.
+        disable_all_and_send(): Disable all parameters then send.
+        show_all_stimparams(): Print all parameters.
+        all_parameters_enabled() -> bool: Check if all parameters are enabled.
+        reset(): Clear all parameters.
+        get_log() -> DataFrame: Return full log history.
+    """
+
+    def __init__(
+        self,
+        stimparams: List[StimParam] | None,
+        intan: IntanSoftware = None,
+        verbose: bool = True,
+        must_connect: bool = False,
+    ):
+        self._stimparams: List[StimParam] = []
+        self._used_electrodes: list = []
+        self._used_triggers: list = []
+        self._sites: dict = {}
+        self._meas: dict = {}
+        self._electrode_param_mapping: dict = {}
+
+        self.log = LogHistory(verbose)
+        self.log.info("Please remember to book the system before connecting to the Intan.")
+
+        self.intan = intan
+        self.stimparams = stimparams  # uses the setter
+
+        if self.intan is None:
+            if must_connect:
+                raise RuntimeError("Could not connect to Intan")
+            else:
+                self.log.warning(
+                    "Could not connect to Intan. You may validate parameters but "
+                    "sending them to the Intan will not be possible."
+                )
+
+    # -- property ------------------------------------------------------------
+
+    @property
+    def stimparams(self) -> List[StimParam]:
+        return self._stimparams
+
+    @stimparams.setter
+    def stimparams(self, new_stimparams: List[StimParam] | None):
+        if new_stimparams is None:
+            self._stimparams = []
+            self.log.info("No parameters set.")
+            return
+        for param in new_stimparams:
+            if not isinstance(param, StimParam):
+                raise ValueError(f"{param} is not a StimParam instance")
+        self._stimparams = new_stimparams
+        self._update_parameters()
+
+    # -- internal ------------------------------------------------------------
+
+    def _clear_records(self):
+        self._used_electrodes = []
+        self._used_triggers = []
+        self._electrode_param_mapping = {}
+        self._sites = {}
+        self._meas = {}
+
+    def _update_parameters(self):
+        if not self._stimparams:
+            return
+        self._clear_records()
+        for param in self.stimparams:
+            if param.index in self._used_electrodes:
+                raise ValueError(
+                    f"Electrode {param.index} is already in use. "
+                    "Only one parameter per electrode is allowed."
+                )
+            self._used_electrodes.append(param.index)
+            if param.trigger_key in self._used_triggers:
+                self._used_triggers.append(param.trigger_key)
+            if not (0 <= param.index <= 127):
+                raise ValueError(f"Invalid electrode number: {param.index}")
+            if not (0 <= param.trigger_key <= 15):
+                raise ValueError(f"Invalid trigger key: {param.trigger_key}")
+            if param.phase_duration1 < 0 or param.phase_duration2 < 0:
+                raise ValueError(
+                    f"Invalid phase duration: {param.phase_duration1}, {param.phase_duration2}"
+                )
+            if param.phase_amplitude1 < 0 or param.phase_amplitude2 < 0:
+                raise ValueError(
+                    f"Invalid phase amplitude: {param.phase_amplitude1}, {param.phase_amplitude2}"
+                )
+            if param.phase_duration1 > 500 or param.phase_duration2 > 500:
+                self.log.warning(
+                    f"Phase duration exceeds 500 us: "
+                    f"{param.phase_duration1}, {param.phase_duration2}"
+                )
+            if (
+                param.phase_duration1 * param.phase_amplitude1
+                != param.phase_duration2 * param.phase_amplitude2
+                and param.stim_shape in (
+                    StimShape.Biphasic,
+                    StimShape.BiphasicWithInterphaseDelay,
+                )
+            ):
+                self.log.warning(
+                    f"Pulses are not charge-balanced for electrode {param.index}. "
+                    "Ensure phase_duration * phase_amplitude is equal for both phases."
+                )
+            if (
+                param.stim_shape == StimShape.Triphasic
+                and param.phase_duration2 * param.phase_amplitude2 * 2
+                != param.phase_duration1 * param.phase_amplitude1
+            ):
+                self.log.warning(
+                    f"Pulses are not charge-balanced for electrode {param.index} "
+                    "(Triphasic). Ensure phase2_dur * phase2_amp * 2 == phase1_dur * phase1_amp."
+                )
+            self._electrode_param_mapping[param.index] = param
+            self._sites[param.index] = Site.get_from_electrode(param.index)
+            self._meas[param.index] = MEA.get_from_electrode(param.index)
+
+        if len(set(self._meas.values())) > 1:
+            self.log.warning(
+                "Parameters span multiple MEAs. Please confirm this is intentional."
+            )
+
+    # -- public --------------------------------------------------------------
+
+    def get_log(self) -> pd.DataFrame:
+        """Return a DataFrame of all log messages."""
+        return self.log.get_history()
+
+    def reset(self):
+        """Clear all parameters."""
+        self.stimparams = []
+
+    def add_stimparam(self, stimparam: StimParam) -> bool:
+        """Append a new StimParam to the list."""
+        try:
+            self.stimparams.append(stimparam)
+            self._update_parameters()
+            return True
+        except Exception as exc:
+            self.log.error(f"Error: {exc}")
+            return False
+
+    def show_all_stimparams(self):
+        """Print all parameters."""
+        if not self.stimparams:
+            self.log.info("No parameters to display.")
+            return
+        for electrode, stimparam in self._electrode_param_mapping.items():
+            self.log.info(f"Electrode {electrode}:\n{stimparam.display_attributes()}")
+            self.log.info("*" * 50)
+
+    def all_parameters_enabled(self) -> bool:
+        """Return True if all parameters are enabled."""
+        if not self._stimparams:
+            return False
+        return all(param.enable for param in self.stimparams)
+
+    def enable_all(self):
+        """Enable all parameters."""
+        if not self._stimparams:
+            self.log.warning("No parameters to enable.")
+            return
+        for param in self.stimparams:
+            param.enable = True
+
+    def disable_all(self):
+        """Disable all parameters."""
+        if not self._stimparams:
+            self.log.warning("No parameters to disable.")
+            return
+        for param in self.stimparams:
+            param.enable = False
+
+    def _send_parameters(self):
+        if self.intan is None:
+            raise ValueError("Intan not connected")
+        if not self._stimparams:
+            self.log.warning("No parameters to send.")
+            return
+        self._update_parameters()
+        self.intan.send_stimparam(self.stimparams)
+
+    def send_parameters(self) -> bool:
+        """Send parameters to the Intan.
+
+        Returns:
+            bool: True on success, False on failure.
+        """
+        try:
+            if self.intan is None:
+                raise ValueError("Intan not connected")
+            if not self._stimparams:
+                self.log.warning("No parameters to send.")
+                return False
+            if not self.all_parameters_enabled():
+                self.log.warning(
+                    "Some parameters are disabled. Enable all parameters you intend to use."
+                )
+            self.log.info("Sending... Please wait 10 seconds")
+            self.intan.send_stimparam(self.stimparams)
+            self.log.info("Done.")
+            return True
+        except Exception as exc:
+            self.log.error(f"Error: {exc}")
+            return False
+
+    def disable_all_and_send(self) -> bool:
+        """Disable all parameters and send the update to the Intan.
+
+        Returns:
+            bool: True on success, False on failure.
+        """
+        try:
+            if not self._stimparams:
+                self.log.warning("No parameters to disable.")
+                return False
+            self.disable_all()
+            self._send_parameters()
+            self.log.info("All parameters disabled and sent to Intan.")
+            return True
+        except Exception as exc:
+            self.log.error(f"Error: {exc}")
+            return False
+
+
+# ---------------------------------------------------------------------------
+# ExtendedTimedelta
+# ---------------------------------------------------------------------------
+
+class ExtendedTimedelta(timedelta):
+    """Minimal extension of timedelta with convenience unit-conversion methods."""
+
+    def as_minutes(self) -> float:
+        return self.total_seconds() / 60
+
+    def as_seconds(self) -> float:
+        return self.total_seconds()
+
+    def as_milliseconds(self) -> float:
+        return self.total_seconds() * 1e3
+
+    def as_microseconds(self) -> float:
+        return self.total_seconds() * 1e6
+
+    def to_hertz(self) -> float:
+        if self.total_seconds() == 0:
+            print("Period is zero. Returning np.inf Hz.")
+            return np.inf
+        return 1 / self.total_seconds()
+
+
+# ---------------------------------------------------------------------------
+# StimParamGrid
+# ---------------------------------------------------------------------------
 
 @dataclass
 class StimParamGrid:
@@ -115,21 +420,23 @@ class StimParamGrid:
 
     Attributes:
         amplitudes: list[float]
-            List of amplitudes to scan. Recommended to stay between 0.1 and 5.
+            Amplitudes to scan (uA). Recommended range: 0.1-5.
         durations: list[float]
-            List of durations to scan. Recommended to stay between 10 and 400.
+            Durations to scan (us). Recommended range: 10-400.
         polarities: list[StimPolarity]
-            List of polarities to scan. Accepted values are StimPolarity.NegativeFirst and StimPolarity.PositiveFirst.
+            Polarities to scan. Accepted: StimPolarity.NegativeFirst / PositiveFirst.
         interphase_delays: list[float]
-            List of interphase delays to scan. How long to wait between the end of the first phase and the start of the second phase.
+            Inter-phase delays to scan (us).
         nb_pulses: list[int]
-            List of number of pulses to scan. Will creat a spike train with the period specified in pulse_train_periods.
+            Number of pulses per train.
         pulse_train_periods: list[float]
-            List of pulse train periods to scan. No effect if nb_pulses is 1.
+            Pulse train periods (us). No effect when nb_pulses == 1.
         post_stim_ref_periods: list[float]
-            List of post stimulation refractory periods to scan. Affects the time after a stimulation where no other stimulation can be sent.
+            Post-stimulation refractory periods (us).
         stim_shapes: list[StimShape]
-            List of stimulation shapes to scan. Accepted values are StimShape.Biphasic and StimShape.BiphasicWithInterphaseDelay.
+            Stimulation shapes. Accepted: StimShape.Biphasic / BiphasicWithInterphaseDelay.
+        mea_type: MEAType
+            MEA layout. Defaults to MEAType.MEA4x8.
     """
 
     amplitudes: list[float] = field(default_factory=list)
@@ -143,7 +450,7 @@ class StimParamGrid:
     mea_type: MEAType = MEAType.MEA4x8
 
     def __post_init__(self):
-        attributes = {
+        type_checks = {
             "amplitudes": (int, float),
             "durations": (int, float),
             "interphase_delays": (int, float),
@@ -152,17 +459,16 @@ class StimParamGrid:
             "post_stim_ref_periods": (int, float),
             "stim_shapes": StimShape,
         }
-
-        for attr, types in attributes.items():
+        for attr, types in type_checks.items():
             if not all(isinstance(item, types) for item in getattr(self, attr)):
                 raise ValueError(f"All items in {attr} must be of type {types}.")
 
         if not isinstance(self.mea_type, MEAType):
-            raise ValueError("MEA type must be a MEAType object.")
+            raise ValueError("mea_type must be a MEAType instance.")
 
-        if any(shape == StimShape.Triphasic for shape in self.stim_shapes):
+        if any(s == StimShape.Triphasic for s in self.stim_shapes):
             raise NotImplementedError(
-                "Triphasic stimulation is not supported by this utility currently."
+                "Triphasic stimulation is not currently supported."
             )
 
         default_param = StimParam()
@@ -176,29 +482,32 @@ class StimParamGrid:
             "post_stim_ref_periods": default_param.post_stim_ref_period,
             "stim_shapes": default_param.stim_shape,
         }
-
         for attr, default in defaults.items():
             if not getattr(self, attr):
                 setattr(self, attr, [default])
 
     def total_combinations(self) -> int:
-        """Returns the total number of combinations."""
-        total_combinations = 1
-        for attr_name, attr in self.__dict__.items():
-            if isinstance(attr, list) and not attr_name.startswith("_"):
-                total_combinations *= len(attr)
-        return total_combinations
+        """Return the total number of parameter combinations."""
+        total = 1
+        for name, val in self.__dict__.items():
+            if isinstance(val, list) and not name.startswith("_"):
+                total *= len(val)
+        return total
 
     def display_grid(self):
-        """Prints all the parameters in the grid."""
+        """Print all parameter lists."""
         for k, v in self.__dict__.items():
             if not k.startswith("_"):
                 print(f"{k}: {v}")
 
 
+# ---------------------------------------------------------------------------
+# StimParamFactory
+# ---------------------------------------------------------------------------
+
 @dataclass
 class StimParamFactory:
-    """Factory class to create StimParam objects from the grid."""
+    """Creates StimParam objects from a single parameter combination."""
 
     amplitude1: float
     amplitude2: float
@@ -211,7 +520,7 @@ class StimParamFactory:
     post_stim_ref_period: float
     stim_shape: StimShape
 
-    def create_from(self):
+    def create_from(self) -> StimParam:
         p = StimParam()
         p.phase_amplitude1 = self.amplitude1
         p.phase_amplitude2 = self.amplitude2
@@ -225,7 +534,7 @@ class StimParamFactory:
         p.stim_shape = self.stim_shape
         return p
 
-    def get_names(self):
+    def get_names(self) -> dict:
         return {
             "Amplitude": self.amplitude1,
             "Duration": self.duration1,
@@ -242,6 +551,10 @@ class StimParamFactory:
             print(f"- {k}: {v}")
 
 
+# ---------------------------------------------------------------------------
+# StimScan
+# ---------------------------------------------------------------------------
+
 class StimScan:
     def __init__(
         self,
@@ -251,8 +564,8 @@ class StimScan:
         durations: list[float],
         polarities: list[StimPolarity],
         scan_channels: list[int],
-        delay_btw_stim: float,       # in seconds
-        delay_btw_channels: float,   # in seconds
+        delay_btw_stim: float,       # seconds
+        delay_btw_channels: float,   # seconds
         repeats_per_channel: int,
         testing: bool = False,
     ):
@@ -264,28 +577,23 @@ class StimScan:
             booking_email: str
                 Email used for booking the trigger controller.
             amplitudes: list[float]
-                List of amplitudes to scan.
+                List of amplitudes to scan (uA).
             durations: list[float]
-                List of durations to scan.
+                List of durations to scan (us).
             polarities: list[StimPolarity]
                 List of polarities to scan.
             scan_channels: list[int]
-                The list of channels to scan. Must be part of electrodes listed in
-                the experiment token.
+                Channels to scan. Must be within the experiment's allowed electrodes.
             delay_btw_stim: float
-                The delay between each stimulation in seconds. Note that if you are
-                using pulse trains, this should be larger than the duration of the
-                full pulse train.
+                Delay between each stimulation in seconds. Should exceed the full
+                pulse-train duration when nb_pulses > 1.
             delay_btw_channels: float
-                The delay between each channel stimulation in seconds. Use a higher
-                value if you are concerned about fatigue or cross-talk.
+                Delay between channel stimulations in seconds.
             repeats_per_channel: int
                 Number of times each parameter combination is repeated per channel.
             testing: bool
-                If True, runs the scan in dry-run mode: parameters are built and
-                logged as normal, but no stimulations are sent to the hardware.
-                Useful for verifying scan configuration without using experiment time.
-                Defaults to False.
+                Dry-run mode. Parameters are built and logged normally but no
+                stimulations are sent to hardware. Defaults to False.
         """
         self.testing = testing
         if self.testing:
@@ -320,10 +628,10 @@ class StimScan:
         self._intan = IntanSoftware()
         self._db = Database()
 
-        self._channels_per_trigger = {}
+        self._channels_per_trigger: dict = {}
         self._current_factory_id = None
-        self._stim_history = OrderedDict()
-        self._params_per_site = {}
+        self._stim_history: OrderedDict = OrderedDict()
+        self._params_per_site: dict = {}
 
         if not np.all(np.isin(scan_channels, self.fs_experiment.electrodes)):
             raise ValueError(
@@ -337,13 +645,12 @@ class StimScan:
             self._params_per_site[site] += 1
             if self._params_per_site[site] > self.mea_type.get_electrodes_per_site():
                 raise ValueError(
-                    f"Too many provided channels for site {site}. Are all channels on the same MEA?"
+                    f"Too many channels provided for site {site}. "
+                    "Are all channels on the same MEA?"
                 )
 
         mea = MEA.get_from_electrode(scan_channels[0]).value
-        if not all(
-            MEA.get_from_electrode(channel).value == mea for channel in scan_channels
-        ):
+        if not all(MEA.get_from_electrode(ch).value == mea for ch in scan_channels):
             raise ValueError("All channels must be on the same MEA.")
         self.mea = mea
 
@@ -352,18 +659,16 @@ class StimScan:
     # ------------------------------------------------------------------
 
     def get_stimulation_parameter_history(self) -> pd.DataFrame:
-        """Returns a DataFrame of all the stimulation parameters sent (or
-        simulated in testing mode)."""
+        """Return a DataFrame of all stimulation parameters sent (or simulated)."""
         return pd.DataFrame.from_dict(self._stim_history, orient="index")
 
     def get_scan_duration(self) -> timedelta:
-        """Returns the predicted time needed to run the scan with the chosen parameters."""
+        """Return the predicted duration of the scan."""
         nb_combinations = self.parameter_grid.total_combinations()
         nb_channels = len(self.scan_channels)
 
         stim_time = self.repeats_per_channel * self.delay_btw_stim
-        inter_channel_time = self.delay_btw_channels
-        time_per_combination = nb_channels * (stim_time + inter_channel_time)
+        time_per_combination = nb_channels * (stim_time + self.delay_btw_channels)
 
         if self.mea_type == MEAType.MEA4x8:
             intan_load_time = timedelta(seconds=20)
@@ -373,21 +678,18 @@ class StimScan:
             nb_loaders = 2
         else:
             raise ValueError(
-                f"Unsupported MEA type: {self.mea_type}, "
-                "choose MEAType.MEA4x8 or MEAType.MEA32"
+                f"Unsupported MEA type: {self.mea_type}. "
+                "Choose MEAType.MEA4x8 or MEAType.MEA32."
             )
 
-        cleanup_overhead = timedelta(seconds=10 * nb_loaders)
         total_time = (
             nb_combinations * (time_per_combination + intan_load_time)
-            + cleanup_overhead
+            + timedelta(seconds=10 * nb_loaders)
         )
-
-        total_seconds = int(total_time.total_seconds())
-        h = total_seconds // 3600
-        m = (total_seconds % 3600) // 60
-        s = total_seconds % 60
-        print(f"Predicted duration of the scan : {h}h {m}m {s}s")
+        total_s = int(total_time.total_seconds())
+        h, remainder = divmod(total_s, 3600)
+        m, s = divmod(remainder, 60)
+        print(f"Predicted scan duration: {h}h {m}m {s}s")
         return total_time
 
     # ------------------------------------------------------------------
@@ -395,11 +697,11 @@ class StimScan:
     # ------------------------------------------------------------------
 
     def run(self):
-        """Runs the stimulation scan.
+        """Run the stimulation scan.
 
-        In testing mode the experiment is still started/stopped so that timing
+        In testing mode the experiment is started/stopped normally so timing
         and parameter-building logic can be validated, but no triggers are fired
-        and no parameters are loaded onto the hardware.
+        and no parameters are uploaded to hardware.
         """
         try:
             if self.fs_experiment.start():
@@ -422,30 +724,28 @@ class StimScan:
     # ------------------------------------------------------------------
 
     def save_results(self, output_dir: str = ".") -> dict[str, Path]:
-        """Fetches results from the database and saves them to CSV files.
+        """Fetch results from the database and save them to CSV files.
 
         Three files are written:
 
-        * ``stim_history.csv``    — the stimulation parameter log recorded
-          during the run (generated locally, no DB query needed).
-        * ``spike_activity.csv``  — spike events fetched from the database for
-          the duration of the run, via ``db.get_spike_event``.
-        * ``triggers.csv``        — trigger records fetched from the database
-          for the duration of the run, via ``db.get_all_triggers``.
+        * ``stim_history.csv``   - stimulation parameter log recorded during
+          the run (local, no DB query needed).
+        * ``spike_activity.csv`` - spike events for the run window via
+          ``db.get_spike_event``.
+        * ``triggers.csv``       - trigger records for the run window via
+          ``db.get_all_triggers``.
 
         Args:
             output_dir: str
-                Directory where the CSV files will be written. Defaults to the
-                current working directory. The directory is created if it does
-                not exist.
+                Directory in which to write the CSV files. Created if absent.
+                Defaults to the current working directory.
 
         Returns:
-            dict[str, Path]: Mapping of file role to the saved Path, with keys
-            ``"stim_history"``, ``"spike_activity"``, and ``"triggers"``.
+            dict[str, Path]: Keys are ``"stim_history"``, ``"spike_activity"``,
+            and ``"triggers"``.
 
         Raises:
-            RuntimeError: If the scan has not been run yet (``start_time`` or
-            ``stop_time`` are None).
+            RuntimeError: If called before a completed run.
         """
         if self.start_time is None or self.stop_time is None:
             raise RuntimeError(
@@ -454,11 +754,10 @@ class StimScan:
 
         out = Path(output_dir)
         out.mkdir(parents=True, exist_ok=True)
-
         saved_paths: dict[str, Path] = {}
         exp_name = self.fs_experiment.exp_name
 
-        # ---- 1. Stimulation parameter history (local, no DB needed) --------
+        # 1. Stimulation history (local) -------------------------------------
         stim_history_path = out / "stim_history.csv"
         stim_df = self.get_stimulation_parameter_history()
         stim_df.index.name = "timestamp_utc"
@@ -466,16 +765,11 @@ class StimScan:
         saved_paths["stim_history"] = stim_history_path
         print(f"Saved stimulation history  -> {stim_history_path}")
 
-        # ---- 2. Spike activity (db.get_spike_event) ------------------------
-        # Per best-practices guidance: keep query windows manageable.
-        # We query the full run window here; callers may wish to split this
-        # for very long runs.
+        # 2. Spike activity --------------------------------------------------
         activity_path = out / "spike_activity.csv"
         try:
             spike_df = self._db.get_spike_event(
-                self.start_time,
-                self.stop_time,
-                exp_name,
+                self.start_time, self.stop_time, exp_name
             )
             spike_df.to_csv(activity_path, index=False)
             saved_paths["spike_activity"] = activity_path
@@ -483,13 +777,10 @@ class StimScan:
         except Exception as exc:
             print(f"Warning: could not fetch spike activity from DB: {exc}")
 
-        # ---- 3. Triggers (db.get_all_triggers) -----------------------------
+        # 3. Triggers --------------------------------------------------------
         triggers_path = out / "triggers.csv"
         try:
-            triggers_df = self._db.get_all_triggers(
-                self.start_time,
-                self.stop_time,
-            )
+            triggers_df = self._db.get_all_triggers(self.start_time, self.stop_time)
             triggers_df.to_csv(triggers_path, index=False)
             saved_paths["triggers"] = triggers_path
             print(f"Saved triggers             -> {triggers_path}")
@@ -502,16 +793,12 @@ class StimScan:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _get_param_indices_by_trigger(self, trigger_key, loader):
-        channels = []
-        for param in loader.stimparams:
-            if param.trigger_key == trigger_key:
-                channels.append(param.index)
-        return channels
+    def _get_param_indices_by_trigger(self, trigger_key: int, loader: StimParamLoader) -> list[int]:
+        return [p.index for p in loader.stimparams if p.trigger_key == trigger_key]
 
-    def _create_parameters_factory(self):
-        parameters_factories = {}
-        for i, combination in enumerate(
+    def _create_parameters_factory(self) -> dict[int, StimParamFactory]:
+        factories = {}
+        for i, (amp, dur, pol, ipd, nbp, ptp, psrp, ss) in enumerate(
             product(
                 self.parameter_grid.amplitudes,
                 self.parameter_grid.durations,
@@ -523,8 +810,7 @@ class StimScan:
                 self.parameter_grid.stim_shapes,
             )
         ):
-            amp, dur, pol, ipd, nbp, ptp, psrp, ss = combination
-            parameters_factories[i] = StimParamFactory(
+            factories[i] = StimParamFactory(
                 amplitude1=amp,
                 amplitude2=amp,
                 duration1=dur,
@@ -536,7 +822,7 @@ class StimScan:
                 post_stim_ref_period=psrp,
                 stim_shape=ss,
             )
-        return parameters_factories
+        return factories
 
     def _bind_parameter(self, params, factory, trigger_key, trigger_counter, index):
         p = factory.create_from()
@@ -553,10 +839,10 @@ class StimScan:
                 self._channels_per_trigger[p.trigger_key].append(p.index)
 
     def _make_parameters(self):
-        """Builds loader objects for the current factory.
+        """Build loader objects for the current factory.
 
-        In testing mode the loaders are still created so that parameter
-        validation logic is exercised, but ``send_parameters`` is not called.
+        In testing mode loaders are still created for validation purposes,
+        but ``send_parameters`` is not called.
         """
         factory = self.parameters[self._current_factory_id]
         triggers_counter = np.zeros(16)
@@ -574,51 +860,34 @@ class StimScan:
                     )
             needed_triggers = np.where(triggers_counter > 0)[0]
             self.loaders = [
-                (
-                    needed_triggers,
-                    StimParamLoader(params, self._intan, verbose=False),
-                )
+                (needed_triggers, StimParamLoader(params, self._intan, verbose=False))
             ]
+
         elif self.mea_type == MEAType.MEA32:
-            params_16 = []
-            params_32 = []
+            params_16, params_32 = [], []
             for trigger_key in range(16):
                 self._bind_parameter(
-                    params_16,
-                    factory,
-                    trigger_key,
-                    triggers_counter,
+                    params_16, factory, trigger_key, triggers_counter,
                     self.mea * 32 + trigger_key,
                 )
                 self._bind_parameter(
-                    params_32,
-                    factory,
-                    trigger_key,
-                    triggers_counter,
+                    params_32, factory, trigger_key, triggers_counter,
                     self.mea * 32 + 16 + trigger_key,
                 )
             needed_triggers = np.where(triggers_counter > 0)[0]
             self.loaders = [
-                (
-                    needed_triggers,
-                    StimParamLoader(params_16, self._intan, verbose=False),
-                ),
-                (
-                    needed_triggers,
-                    StimParamLoader(params_32, self._intan, verbose=False),
-                ),
+                (needed_triggers, StimParamLoader(params_16, self._intan, verbose=False)),
+                (needed_triggers, StimParamLoader(params_32, self._intan, verbose=False)),
             ]
 
     def _send_stim(self):
-        """Sends stimulation triggers for the current factory.
+        """Send stimulation triggers for the current factory.
 
         When ``self.testing`` is True:
-          - Parameters are *not* loaded onto the hardware.
-          - Triggers are *not* fired.
-          - The stim history is still updated so that post-run analysis methods
-            work correctly in testing mode.
-          - ``sleep`` calls are still executed so that timing estimates remain
-            valid.
+          - Parameters are not uploaded to hardware.
+          - Triggers are not fired.
+          - The stim history is still updated so post-run analysis works.
+          - ``sleep`` calls still execute so timing estimates remain valid.
         """
         for needed_triggers, loader in self.loaders:
             if not self.testing:
@@ -630,7 +899,7 @@ class StimScan:
 
                 for _ in range(self.repeats_per_channel):
                     params_data_dict = asdict(self.parameters[self._current_factory_id])
-                    params_data_dict["trigger_key"] = trigger
+                    params_data_dict["trigger_key"] = int(trigger)
                     params_data_dict["param_id"] = self._current_factory_id
                     params_data_dict["channel"] = self._get_param_indices_by_trigger(
                         trigger, loader
