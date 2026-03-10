@@ -835,7 +835,7 @@ class StimScan:
         self.fs_experiment = Experiment(token=self.token)
         self._trigger_gen = TriggerController(self.booking_email)
         self._intan = IntanSoftware()
-        self.log.info("Hardware connected. FS name: %s", self.fs_experiment.exp_name)
+        self.log.info(f"Hardware connected. FS name:{self.fs_experiment.exp_name}")
 
     def _get_param_indices_by_trigger(self, trigger_key: int, loader: StimParamLoader) -> list[int]:
         return [p.index for p in loader.stimparams if p.trigger_key == trigger_key]
