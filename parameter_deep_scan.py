@@ -346,8 +346,8 @@ class ResponsiveElectrodeExperiment:
     spike_window_post_stim_s : float
         Extra seconds added to the DB query window after the experiment stops
         (default 5.0).
-    output_dir : Path
-        Directory where all result files are written (default ``./results``).
+    output_dir : str
+        Directory string where all result files are written (default ``./results``).
     testing : bool
         When ``True``, no hardware connections are made and no triggers are sent.
         All logic, logging, and file saving still runs normally so the full
@@ -363,7 +363,7 @@ class ResponsiveElectrodeExperiment:
         inter_stim_delay_s: float = 1.0,
         param_send_wait_s: float = 10.0,
         spike_window_post_stim_s: float = 5.0,
-        output_dir: Path = Path("./results"),
+        output_dir: str = "./results",
         testing: bool = False,
     ) -> None:
         self._token = token
@@ -372,7 +372,7 @@ class ResponsiveElectrodeExperiment:
         self._delay = inter_stim_delay_s
         self._param_send_wait = param_send_wait_s
         self._spike_window = spike_window_post_stim_s
-        self._output_dir = output_dir
+        self._output_dir = Path(output_dir)
         self._testing = testing
 
         connections = [
