@@ -450,6 +450,14 @@ class StimParamGrid:
     mea_type: MEAType = MEAType.MEA4x8
 
     def __post_init__(self):
+        # Coerce raw integer values back to StimPolarity enum members.
+        # Necessary when parameters arrive via JSON (e.g. from Datalore),
+        # where StimPolarity.NegativeFirst.value serialises to plain 0.
+        self.polarities = [
+            StimPolarity(p) if not isinstance(p, StimPolarity) else p
+            for p in self.polarities
+        ]
+
         type_checks = {
             "amplitudes": (int, float),
             "durations": (int, float),
