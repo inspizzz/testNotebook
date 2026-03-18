@@ -108,7 +108,6 @@ class StimulationRecord:
     duration: float
     polarity: str
     trigger_key: int
-    trigger_tag: int
     timestamp_utc: str
     testing: bool
 
@@ -321,8 +320,6 @@ class DataSaver:
         -------
         round_index         : stimulation round (0-based)
         rep_index           : repetition within the round (1-based)
-        tag                 : trigger tag sent to Intan
-        set_tag_trigger_ms  : wall-clock time for intan.set_tag_trigger() in ms
         trigger_send_ms     : wall-clock time for trigger_ctrl.send() in ms
         sleep_ms            : actual time spent in time.sleep() in ms
         total_rep_ms        : total wall-clock time for the full rep in ms
@@ -631,7 +628,6 @@ class ResponsiveElectrodeExperiment:
         Timing instrumentation
         ----------------------
         Each rep measures the wall-clock cost of:
-          - ``set_tag_trigger()``
           - ``trigger_ctrl.send()``
           - ``time.sleep()``
           - total rep duration
@@ -640,10 +636,8 @@ class ResponsiveElectrodeExperiment:
         needing to set DEBUG level.
         """
         electrode_list = list(stim_round.connections.keys())
-        global_tag_base = stim_round.round_index * self._n_stims
 
         # Per-rep timing accumulators (only populated in live mode)
-        t_tag_ms:   List[float] = []
         t_send_ms:  List[float] = []
         t_sleep_ms: List[float] = []
         t_total_ms: List[float] = []
@@ -651,7 +645,6 @@ class ResponsiveElectrodeExperiment:
         for rep in range(self._n_stims):
             t_rep_start = time.monotonic()
             ts = datetime.now(timezone.utc)
-            tag = global_tag_base + rep + 1
 
             if self._testing:
                 log.debug(
@@ -664,33 +657,23 @@ class ResponsiveElectrodeExperiment:
                 )
             else:
                 t0 = time.monotonic()
-                self._intan.set_tag_trigger(tag)
-                t_tag = (time.monotonic() - t0) * 1000.0
-
-                t0 = time.monotonic()
                 self._trigger_ctrl.send(trigger_array)
                 t_send = (time.monotonic() - t0) * 1000.0
 
-                t_tag_ms.append(t_tag)
                 t_send_ms.append(t_send)
                 self._timing_log.append({
-                    "round_index": stim_round.round_index,
-                    "rep_index":   rep + 1,
-                    "tag":         tag,
-                    "set_tag_trigger_ms": round(t_tag, 3),
-                    "trigger_send_ms":    round(t_send, 3),
+                    "round_index":     stim_round.round_index,
+                    "rep_index":       rep + 1,
+                    "trigger_send_ms": round(t_send, 3),
                 })
 
                 log.debug(
-                    "  round=%d  rep=%04d/%04d  electrodes=%s  tag=%d  ts=%s  "
-                    "set_tag=%.1fms  send=%.1fms",
+                    "  round=%d  rep=%04d/%04d  electrodes=%s  ts=%s  send=%.1fms",
                     stim_round.round_index,
                     rep + 1,
                     self._n_stims,
                     electrode_list,
-                    tag,
                     ts.isoformat(),
-                    t_tag,
                     t_send,
                 )
 
@@ -705,7 +688,6 @@ class ResponsiveElectrodeExperiment:
                         duration=conn.duration,
                         polarity=conn.polarity,
                         trigger_key=stim_round.trigger_key,
-                        trigger_tag=tag,
                         timestamp_utc=ts.isoformat(),
                         testing=self._testing,
                     )
@@ -718,13 +700,13 @@ class ResponsiveElectrodeExperiment:
 
             # Back-fill sleep and total into the timing row written above
             if not self._testing and self._timing_log:
-                self._timing_log[-1]["sleep_ms"]       = round(t_sleep_ms[-1], 3)
-                self._timing_log[-1]["total_rep_ms"]   = round(t_total_ms[-1], 3)
+                self._timing_log[-1]["sleep_ms"]     = round(t_sleep_ms[-1], 3)
+                self._timing_log[-1]["total_rep_ms"] = round(t_total_ms[-1], 3)
 
         # ------------------------------------------------------------------
         # Round timing summary — logged at INFO so it always appears
         # ------------------------------------------------------------------
-        if not self._testing and t_tag_ms:
+        if not self._testing and t_send_ms:
             def _fmt(vals: List[float]) -> str:
                 mean = sum(vals) / len(vals)
                 std = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
@@ -732,13 +714,11 @@ class ResponsiveElectrodeExperiment:
 
             log.info(
                 "  Round %d timing summary (%d reps):\n"
-                "    set_tag_trigger : %s\n"
-                "    trigger.send    : %s\n"
-                "    time.sleep      : %s\n"
-                "    total per rep   : %s",
+                "    trigger.send  : %s\n"
+                "    time.sleep    : %s\n"
+                "    total per rep : %s",
                 stim_round.round_index,
-                len(t_tag_ms),
-                _fmt(t_tag_ms),
+                len(t_send_ms),
                 _fmt(t_send_ms),
                 _fmt(t_sleep_ms),
                 _fmt(t_total_ms),
@@ -812,15 +792,42 @@ class ResponsiveElectrodeExperiment:
         df.columns = [c.strip() for c in df.columns]
 
         if "_time" in df.columns and "up" in df.columns:
-            # Real DB schema: rename and convert the int up/down flag to strings
+            # Real DB schema: rename and convert the up/down flag to status strings.
+            # The 'up' column has been observed as int (1/0), float (1.0/0.0),
+            # bool (True/False), and string ("1"/"0") depending on DB version,
+            # so coerce to int first before mapping.
             df = df.rename(columns={"_time": "Time", "_value": "tag"})
-            df["status"] = df["up"].map({1: "up", 0: "down"})
-            log.debug("Trigger schema: real (_time/up) -> normalised.")
+            try:
+                up_int = df["up"].astype(float).astype(int)
+            except (ValueError, TypeError):
+                up_int = df["up"]
+            df["status"] = up_int.map({1: "up", 0: "down"})
+            n_unmapped = df["status"].isna().sum()
+            if n_unmapped > 0:
+                log.warning(
+                    "Trigger normalisation: %d row(s) had unexpected 'up' values "
+                    "and could not be mapped to 'up'/'down'. "
+                    "Unique values seen: %s",
+                    n_unmapped,
+                    df["up"].unique().tolist(),
+                )
+            log.info(
+                "Trigger schema: real (_time/up) -> normalised.  "
+                "up-events: %d  down-events: %d  unmapped: %d",
+                (df["status"] == "up").sum(),
+                (df["status"] == "down").sum(),
+                n_unmapped,
+            )
         elif "Time" in df.columns and "status" in df.columns:
             # Documented schema: already correct
             if "tag" not in df.columns:
                 df["tag"] = float("nan")
-            log.debug("Trigger schema: documented (Time/status) -> no change needed.")
+            log.info(
+                "Trigger schema: documented (Time/status) -> no change needed.  "
+                "up-events: %d  down-events: %d",
+                (df["status"] == "up").sum(),
+                (df["status"] == "down").sum(),
+            )
         else:
             log.warning(
                 "Unrecognised trigger DataFrame schema; columns present: %s",
