@@ -313,6 +313,26 @@ class DataSaver:
         log.info("Summary saved -> %s", path)
         return path
 
+    def save_timing_log(self, timing_records: list) -> Path:
+        """
+        Persist per-rep hardware call timings as CSV.
+
+        Columns
+        -------
+        round_index         : stimulation round (0-based)
+        rep_index           : repetition within the round (1-based)
+        tag                 : trigger tag sent to Intan
+        set_tag_trigger_ms  : wall-clock time for intan.set_tag_trigger() in ms
+        trigger_send_ms     : wall-clock time for trigger_ctrl.send() in ms
+        sleep_ms            : actual time spent in time.sleep() in ms
+        total_rep_ms        : total wall-clock time for the full rep in ms
+        """
+        path = Path(f"{self._prefix}_timing.csv")
+        df = pd.DataFrame(timing_records)
+        df.to_csv(path, index=False)
+        log.info("Timing log saved -> %s  (%d rows)", path, len(df))
+        return path
+
     def save_spike_waveforms(self, waveform_records: list) -> Path:
         """
         Persist per-spike raw waveforms for every spike detected within the
@@ -438,6 +458,7 @@ class ResponsiveElectrodeExperiment:
 
         self._plan = StimulationPlan(connections)
         self._stimulation_log: List[StimulationRecord] = []
+        self._timing_log: List[dict] = []   # per-rep hardware call timings
         self._results: Optional[ExperimentResults] = None
 
         # Hardware handles -- assigned inside _connect(); None until then
@@ -606,11 +627,29 @@ class ResponsiveElectrodeExperiment:
         """
         Send ``_n_stims`` trigger pulses for a single round, logging one
         StimulationRecord per electrode per repetition.
+
+        Timing instrumentation
+        ----------------------
+        Each rep measures the wall-clock cost of:
+          - ``set_tag_trigger()``
+          - ``trigger_ctrl.send()``
+          - ``time.sleep()``
+          - total rep duration
+        A summary (mean ± std, min, max) is logged at INFO level at the end of
+        the round so the breakdown is always visible in the experiment log without
+        needing to set DEBUG level.
         """
         electrode_list = list(stim_round.connections.keys())
         global_tag_base = stim_round.round_index * self._n_stims
 
+        # Per-rep timing accumulators (only populated in live mode)
+        t_tag_ms:   List[float] = []
+        t_send_ms:  List[float] = []
+        t_sleep_ms: List[float] = []
+        t_total_ms: List[float] = []
+
         for rep in range(self._n_stims):
+            t_rep_start = time.monotonic()
             ts = datetime.now(timezone.utc)
             tag = global_tag_base + rep + 1
 
@@ -624,16 +663,35 @@ class ResponsiveElectrodeExperiment:
                     ts.isoformat(),
                 )
             else:
+                t0 = time.monotonic()
                 self._intan.set_tag_trigger(tag)
+                t_tag = (time.monotonic() - t0) * 1000.0
+
+                t0 = time.monotonic()
                 self._trigger_ctrl.send(trigger_array)
+                t_send = (time.monotonic() - t0) * 1000.0
+
+                t_tag_ms.append(t_tag)
+                t_send_ms.append(t_send)
+                self._timing_log.append({
+                    "round_index": stim_round.round_index,
+                    "rep_index":   rep + 1,
+                    "tag":         tag,
+                    "set_tag_trigger_ms": round(t_tag, 3),
+                    "trigger_send_ms":    round(t_send, 3),
+                })
+
                 log.debug(
-                    "  round=%d  rep=%04d/%04d  electrodes=%s  tag=%d  ts=%s",
+                    "  round=%d  rep=%04d/%04d  electrodes=%s  tag=%d  ts=%s  "
+                    "set_tag=%.1fms  send=%.1fms",
                     stim_round.round_index,
                     rep + 1,
                     self._n_stims,
                     electrode_list,
                     tag,
                     ts.isoformat(),
+                    t_tag,
+                    t_send,
                 )
 
             for electrode in electrode_list:
@@ -653,7 +711,38 @@ class ResponsiveElectrodeExperiment:
                     )
                 )
 
+            t0 = time.monotonic()
             time.sleep(self._delay)
+            t_sleep_ms.append((time.monotonic() - t0) * 1000.0)
+            t_total_ms.append((time.monotonic() - t_rep_start) * 1000.0)
+
+            # Back-fill sleep and total into the timing row written above
+            if not self._testing and self._timing_log:
+                self._timing_log[-1]["sleep_ms"]       = round(t_sleep_ms[-1], 3)
+                self._timing_log[-1]["total_rep_ms"]   = round(t_total_ms[-1], 3)
+
+        # ------------------------------------------------------------------
+        # Round timing summary — logged at INFO so it always appears
+        # ------------------------------------------------------------------
+        if not self._testing and t_tag_ms:
+            def _fmt(vals: List[float]) -> str:
+                mean = sum(vals) / len(vals)
+                std = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
+                return f"{mean:7.1f} ± {std:5.1f} ms  (min {min(vals):.1f}  max {max(vals):.1f})"
+
+            log.info(
+                "  Round %d timing summary (%d reps):\n"
+                "    set_tag_trigger : %s\n"
+                "    trigger.send    : %s\n"
+                "    time.sleep      : %s\n"
+                "    total per rep   : %s",
+                stim_round.round_index,
+                len(t_tag_ms),
+                _fmt(t_tag_ms),
+                _fmt(t_send_ms),
+                _fmt(t_sleep_ms),
+                _fmt(t_total_ms),
+            )
 
         log.info(
             "  Round %d complete: %d reps x %d electrode(s)%s",
@@ -703,6 +792,60 @@ class ResponsiveElectrodeExperiment:
         time.sleep(self._param_send_wait)
 
     # ------------------------------------------------------------------
+    # Database schema normalisation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalise_trigger_df(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalise the trigger DataFrame returned by ``db.get_all_triggers()``
+        to a consistent internal schema regardless of which DB version is running.
+
+        Two schemas have been observed in the wild:
+
+        Documented schema   : Time (datetime), trigger (int), status (str "up"/"down"), tag (float)
+        Observed real schema: _time (datetime), _value (float), trigger (int), up (int 1/0)
+
+        Output always has: Time (UTC datetime64), trigger (int), status (str), tag (float)
+        """
+        df = df.copy()
+        df.columns = [c.strip() for c in df.columns]
+
+        if "_time" in df.columns and "up" in df.columns:
+            # Real DB schema: rename and convert the int up/down flag to strings
+            df = df.rename(columns={"_time": "Time", "_value": "tag"})
+            df["status"] = df["up"].map({1: "up", 0: "down"})
+            log.debug("Trigger schema: real (_time/up) -> normalised.")
+        elif "Time" in df.columns and "status" in df.columns:
+            # Documented schema: already correct
+            if "tag" not in df.columns:
+                df["tag"] = float("nan")
+            log.debug("Trigger schema: documented (Time/status) -> no change needed.")
+        else:
+            log.warning(
+                "Unrecognised trigger DataFrame schema; columns present: %s",
+                list(df.columns),
+            )
+
+        df["Time"] = pd.to_datetime(df["Time"], utc=True)
+        return df
+
+    @staticmethod
+    def _normalise_spike_df(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalise the spike event DataFrame returned by ``db.get_spike_event()``
+        to ensure the time column is called ``Time`` and is UTC-aware.
+        """
+        df = df.copy()
+        df.columns = [c.strip() for c in df.columns]
+        for candidate in ("_time", "time", "timestamp"):
+            if candidate in df.columns:
+                df = df.rename(columns={candidate: "Time"})
+                break
+        df["Time"] = pd.to_datetime(df["Time"], utc=True)
+        return df
+
+    # ------------------------------------------------------------------
     # Database retrieval
     # ------------------------------------------------------------------
 
@@ -735,6 +878,7 @@ class ResponsiveElectrodeExperiment:
         # tries to access e.g. trigger_df["status"] on a schema-less DataFrame.
         try:
             spike_df = self._db.get_spike_event(start, buffered_stop, fs_name)
+            spike_df = self._normalise_spike_df(spike_df)
             log.info("  Spike events retrieved: %d rows", len(spike_df))
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not retrieve spike events: %s", exc)
@@ -742,6 +886,7 @@ class ResponsiveElectrodeExperiment:
 
         try:
             trigger_df = self._db.get_all_triggers(start, buffered_stop)
+            trigger_df = self._normalise_trigger_df(trigger_df)
             log.info("  Triggers retrieved: %d rows", len(trigger_df))
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not retrieve triggers: %s", exc)
@@ -795,15 +940,13 @@ class ResponsiveElectrodeExperiment:
             )
             return []
 
-        # FIX 1 & 2: Normalise column names (strip whitespace) and verify
-        # that "status" is present before attempting to filter on it.
-        # Logging the actual columns makes future mismatches easy to diagnose.
+        # FIX 1 & 2: Schema is already normalised by _normalise_trigger_df() in
+        # _fetch_database_results, so Time/status/tag are always present here.
+        # This guard is a last-resort safety net only.
         trigger_df = trigger_df.copy()
-        trigger_df.columns = [c.strip() for c in trigger_df.columns]
-
         if "status" not in trigger_df.columns:
             log.warning(
-                "trigger_df is missing the 'status' column. "
+                "trigger_df is missing the 'status' column after normalisation. "
                 "Available columns: %s  -- skipping waveform extraction.",
                 list(trigger_df.columns),
             )
@@ -954,6 +1097,7 @@ class ResponsiveElectrodeExperiment:
         saver.save_spike_events(self._results.spike_events)
         saver.save_triggers(self._results.triggers)
         saver.save_summary(self._results)
+        saver.save_timing_log(self._timing_log)
 
         # Spike waveform extraction -----------------------------------------
         # Uses the DB trigger "up" timestamps as the timing anchor so that
