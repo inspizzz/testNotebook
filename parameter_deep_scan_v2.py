@@ -312,24 +312,6 @@ class DataSaver:
         log.info("Summary saved -> %s", path)
         return path
 
-    def save_timing_log(self, timing_records: list) -> Path:
-        """
-        Persist per-rep hardware call timings as CSV.
-
-        Columns
-        -------
-        round_index         : stimulation round (0-based)
-        rep_index           : repetition within the round (1-based)
-        trigger_send_ms     : wall-clock time for trigger_ctrl.send() in ms
-        sleep_ms            : actual time spent in time.sleep() in ms
-        total_rep_ms        : total wall-clock time for the full rep in ms
-        """
-        path = Path(f"{self._prefix}_timing.csv")
-        df = pd.DataFrame(timing_records)
-        df.to_csv(path, index=False)
-        log.info("Timing log saved -> %s  (%d rows)", path, len(df))
-        return path
-
     def save_spike_waveforms(self, waveform_records: list) -> Path:
         """
         Persist per-spike raw waveforms for every spike detected within the
@@ -455,7 +437,6 @@ class ResponsiveElectrodeExperiment:
 
         self._plan = StimulationPlan(connections)
         self._stimulation_log: List[StimulationRecord] = []
-        self._timing_log: List[dict] = []   # per-rep hardware call timings
         self._results: Optional[ExperimentResults] = None
 
         # Hardware handles -- assigned inside _connect(); None until then
@@ -624,26 +605,10 @@ class ResponsiveElectrodeExperiment:
         """
         Send ``_n_stims`` trigger pulses for a single round, logging one
         StimulationRecord per electrode per repetition.
-
-        Timing instrumentation
-        ----------------------
-        Each rep measures the wall-clock cost of:
-          - ``trigger_ctrl.send()``
-          - ``time.sleep()``
-          - total rep duration
-        A summary (mean ± std, min, max) is logged at INFO level at the end of
-        the round so the breakdown is always visible in the experiment log without
-        needing to set DEBUG level.
         """
         electrode_list = list(stim_round.connections.keys())
 
-        # Per-rep timing accumulators (only populated in live mode)
-        t_send_ms:  List[float] = []
-        t_sleep_ms: List[float] = []
-        t_total_ms: List[float] = []
-
         for rep in range(self._n_stims):
-            t_rep_start = time.monotonic()
             ts = datetime.now(timezone.utc)
 
             if self._testing:
@@ -656,25 +621,14 @@ class ResponsiveElectrodeExperiment:
                     ts.isoformat(),
                 )
             else:
-                t0 = time.monotonic()
                 self._trigger_ctrl.send(trigger_array)
-                t_send = (time.monotonic() - t0) * 1000.0
-
-                t_send_ms.append(t_send)
-                self._timing_log.append({
-                    "round_index":     stim_round.round_index,
-                    "rep_index":       rep + 1,
-                    "trigger_send_ms": round(t_send, 3),
-                })
-
                 log.debug(
-                    "  round=%d  rep=%04d/%04d  electrodes=%s  ts=%s  send=%.1fms",
+                    "  round=%d  rep=%04d/%04d  electrodes=%s  ts=%s",
                     stim_round.round_index,
                     rep + 1,
                     self._n_stims,
                     electrode_list,
                     ts.isoformat(),
-                    t_send,
                 )
 
             for electrode in electrode_list:
@@ -693,36 +647,7 @@ class ResponsiveElectrodeExperiment:
                     )
                 )
 
-            t0 = time.monotonic()
             time.sleep(self._delay)
-            t_sleep_ms.append((time.monotonic() - t0) * 1000.0)
-            t_total_ms.append((time.monotonic() - t_rep_start) * 1000.0)
-
-            # Back-fill sleep and total into the timing row written above
-            if not self._testing and self._timing_log:
-                self._timing_log[-1]["sleep_ms"]     = round(t_sleep_ms[-1], 3)
-                self._timing_log[-1]["total_rep_ms"] = round(t_total_ms[-1], 3)
-
-        # ------------------------------------------------------------------
-        # Round timing summary — logged at INFO so it always appears
-        # ------------------------------------------------------------------
-        if not self._testing and t_send_ms:
-            def _fmt(vals: List[float]) -> str:
-                mean = sum(vals) / len(vals)
-                std = (sum((x - mean) ** 2 for x in vals) / len(vals)) ** 0.5
-                return f"{mean:7.1f} ± {std:5.1f} ms  (min {min(vals):.1f}  max {max(vals):.1f})"
-
-            log.info(
-                "  Round %d timing summary (%d reps):\n"
-                "    trigger.send  : %s\n"
-                "    time.sleep    : %s\n"
-                "    total per rep : %s",
-                stim_round.round_index,
-                len(t_send_ms),
-                _fmt(t_send_ms),
-                _fmt(t_sleep_ms),
-                _fmt(t_total_ms),
-            )
 
         log.info(
             "  Round %d complete: %d reps x %d electrode(s)%s",
@@ -1104,7 +1029,6 @@ class ResponsiveElectrodeExperiment:
         saver.save_spike_events(self._results.spike_events)
         saver.save_triggers(self._results.triggers)
         saver.save_summary(self._results)
-        saver.save_timing_log(self._timing_log)
 
         # Spike waveform extraction -----------------------------------------
         # Uses the DB trigger "up" timestamps as the timing anchor so that
