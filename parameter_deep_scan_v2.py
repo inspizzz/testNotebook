@@ -715,7 +715,10 @@ class ResponsiveElectrodeExperiment:
         """Retrieve spike events and trigger records for the full experiment window."""
         if start is None or stop is None:
             log.warning("Experiment times not set; skipping DB fetch.")
-            return pd.DataFrame(), pd.DataFrame()
+            return (
+                pd.DataFrame(columns=["Time", "channel", "Amplitude"]),
+                pd.DataFrame(columns=["Time", "trigger", "status", "tag"]),
+            )
 
         buffered_stop = stop + timedelta(seconds=self._spike_window)
         log.info(
@@ -726,19 +729,23 @@ class ResponsiveElectrodeExperiment:
             "  [TESTING - no live stimulations were sent]" if self._testing else "",
         )
 
+        # FIX 3: Use typed empty DataFrames as fallbacks so that column names
+        # are always present even when the DB call fails or returns no data.
+        # This prevents KeyError crashes in _fetch_spike_waveforms when it
+        # tries to access e.g. trigger_df["status"] on a schema-less DataFrame.
         try:
             spike_df = self._db.get_spike_event(start, buffered_stop, fs_name)
             log.info("  Spike events retrieved: %d rows", len(spike_df))
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not retrieve spike events: %s", exc)
-            spike_df = pd.DataFrame()
+            spike_df = pd.DataFrame(columns=["Time", "channel", "Amplitude"])
 
         try:
             trigger_df = self._db.get_all_triggers(start, buffered_stop)
             log.info("  Triggers retrieved: %d rows", len(trigger_df))
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not retrieve triggers: %s", exc)
-            trigger_df = pd.DataFrame()
+            trigger_df = pd.DataFrame(columns=["Time", "trigger", "status", "tag"])
 
         return spike_df, trigger_df
 
@@ -778,12 +785,27 @@ class ResponsiveElectrodeExperiment:
             Each dict contains the fields documented in
             ``DataSaver.save_spike_waveforms``.
         """
+        # --- guard: both DataFrames must be non-empty --------------------
         if spike_df.empty or trigger_df.empty:
             log.warning(
                 "Spike waveform extraction skipped: "
                 "spike_df empty=%s  trigger_df empty=%s",
                 spike_df.empty,
                 trigger_df.empty,
+            )
+            return []
+
+        # FIX 1 & 2: Normalise column names (strip whitespace) and verify
+        # that "status" is present before attempting to filter on it.
+        # Logging the actual columns makes future mismatches easy to diagnose.
+        trigger_df = trigger_df.copy()
+        trigger_df.columns = [c.strip() for c in trigger_df.columns]
+
+        if "status" not in trigger_df.columns:
+            log.warning(
+                "trigger_df is missing the 'status' column. "
+                "Available columns: %s  -- skipping waveform extraction.",
+                list(trigger_df.columns),
             )
             return []
 
