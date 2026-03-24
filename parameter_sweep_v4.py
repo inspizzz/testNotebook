@@ -807,13 +807,6 @@ class StimScan:
 
                 # Disable variable threshold for stable event detection during scan
                 # (FinalSpark docs: variable threshold changes during bursts/stimulation)
-                if not self.testing:
-                    logger.info(
-                        "Disabling variable threshold for consistent spike detection "
-                        "during the scan."
-                    )
-                self._intan.var_threshold(False)
-
                 total = len(self.parameters)
                 for idx, factory_id in enumerate(
                     tqdm(self.parameters, desc="Parameter sweep")
@@ -851,16 +844,6 @@ class StimScan:
                 for loader_idx, (_, loader) in enumerate(self.loaders):
                     logger.info("Disabling loader %d StimParams.", loader_idx + 1)
                     loader.disable_all_and_send()
-
-            # Re-enable variable threshold (FinalSpark docs: ALWAYS re-enable)
-            if not self.testing:
-                logger.info("Re-enabling variable threshold.")
-            try:
-                self._intan.var_threshold(True)
-            except Exception as exc:
-                logger.error(
-                    "Failed to re-enable variable threshold: %s", exc
-                )
 
             # Close hardware connections
             logger.info("Closing trigger generator.")
