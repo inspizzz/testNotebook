@@ -364,48 +364,118 @@ class _MockExperiment:
 class StimScan:
     def __init__(
         self,
-        fs_experiment: Experiment,
-        parameter_grid: StimParamGrid,
+        token,
+        booking_email,
         scan_channels,
         delay_btw_stim,  # in seconds
         delay_btw_channels,  # in seconds
         repeats_per_channel,
-        booking_email,
-        testing=False,
+        testing=True,
+        amplitudes=None,
+        durations=None,
+        polarities=None,
+        interphase_delays=None,
+        nb_pulses=None,
+        pulse_train_periods=None,
+        post_stim_ref_periods=None,
+        stim_shapes=None,
+        mea_type=None,
     ):
         """Creates a stimulation parameter scan utility.
 
+        Accepts the same flat keyword arguments that the Datalore notebook
+        runner passes via CLASS_PARAMETERS so the class can be instantiated
+        directly from the remote execution environment.
+
         Args:
-            fs_experiment: Experiment
-                The experiment object to use for the stimulation (requires a token).
-            parameter_grid: StimParamGrid
-                The grid of parameters to scan. See StimParamGrid for more information.
-            scan_channels: list[int]
-                The channels to scan. Must all reside on the same MEA and exist in
-                ``fs_experiment.electrodes``.
-            delay_btw_stim: float
-                Delay between each stimulation in seconds.  Must be ≥ 1 s to allow for
-                fatigue recovery (FinalSpark recommendation: 1–10 s).
-            delay_btw_channels: float
-                Delay between each channel stimulation in seconds.  Use a higher value
-                to mitigate cross-talk and fatigue.
-            repeats_per_channel: int
-                How many times each trigger is fired per parameter combination.
+            token: str
+                Experiment token (used to create an ``Experiment`` object, or
+                a ``_MockExperiment`` when ``testing=True``).
             booking_email: str
                 E-mail used for the FinalSpark booking / trigger controller.
+            scan_channels: list[int]
+                The channels to scan. Must all reside on the same MEA and exist
+                in the experiment's allowed electrode list.
+            delay_btw_stim: float
+                Delay between each stimulation in seconds.  Must be ≥ 1 s to
+                allow for fatigue recovery (FinalSpark recommendation: 1–10 s).
+            delay_btw_channels: float
+                Delay between each channel stimulation in seconds.  Use a
+                higher value to mitigate cross-talk and fatigue.
+            repeats_per_channel: int
+                How many times each trigger is fired per parameter combination.
             testing: bool
-                If True, no hardware is contacted (IntanSoftware, TriggerController,
-                Database are replaced with mocks), no stimulations are sent, all
-                inter-stimulation delays are skipped, but stim_history and logs are
-                still produced.
+                If True, no hardware is contacted (IntanSoftware,
+                TriggerController, Database are replaced with mocks), no
+                stimulations are sent, all inter-stimulation delays are
+                skipped, but stim_history and logs are still produced.
+            amplitudes: list[float] | None
+                Amplitudes to scan (µA).  Falls back to StimParam default.
+            durations: list[float] | None
+                Phase durations to scan (µs).  Falls back to StimParam default.
+            polarities: list[int|StimPolarity] | None
+                Polarities to scan (0 = NegativeFirst, 1 = PositiveFirst).
+            interphase_delays: list[float] | None
+            nb_pulses: list[int] | None
+            pulse_train_periods: list[float] | None
+            post_stim_ref_periods: list[float] | None
+            stim_shapes: list[int|StimShape] | None
+            mea_type: int | MEAType | None
         """
         self.testing = testing
-        self.fs_experiment = fs_experiment
+
+        # ---- Build Experiment (or mock) from token ----
+        if self.testing:
+            logger.info("[TESTING] Mode enabled — hardware classes will NOT be instantiated.")
+            self.fs_experiment = _MockExperiment(
+                exp_name=f"test_{token}", electrodes=list(range(128))
+            )
+        else:
+            self.fs_experiment = Experiment(token)
+
+        # ---- Coerce polarity ints → StimPolarity enums ----
+        if polarities is not None:
+            polarities = [
+                StimPolarity(p) if isinstance(p, int) else p for p in polarities
+            ]
+
+        # ---- Coerce stim_shape ints → StimShape enums ----
+        if stim_shapes is not None:
+            stim_shapes = [
+                StimShape(s) if isinstance(s, int) else s for s in stim_shapes
+            ]
+
+        # ---- Coerce mea_type int → MEAType enum ----
+        if mea_type is not None and not isinstance(mea_type, MEAType):
+            mea_type = MEAType(mea_type)
+
+        # ---- Build StimParamGrid from flat lists ----
+        grid_kwargs = {}
+        if amplitudes is not None:
+            grid_kwargs["amplitudes"] = amplitudes
+        if durations is not None:
+            grid_kwargs["durations"] = durations
+        if polarities is not None:
+            grid_kwargs["polarities"] = polarities
+        if interphase_delays is not None:
+            grid_kwargs["interphase_delays"] = interphase_delays
+        if nb_pulses is not None:
+            grid_kwargs["nb_pulses"] = nb_pulses
+        if pulse_train_periods is not None:
+            grid_kwargs["pulse_train_periods"] = pulse_train_periods
+        if post_stim_ref_periods is not None:
+            grid_kwargs["post_stim_ref_periods"] = post_stim_ref_periods
+        if stim_shapes is not None:
+            grid_kwargs["stim_shapes"] = stim_shapes
+        if mea_type is not None:
+            grid_kwargs["mea_type"] = mea_type
+
+        self.parameter_grid = StimParamGrid(**grid_kwargs)
+
         self.scan_channels = scan_channels
         self.delay_btw_stim = ExtendedTimedelta(seconds=delay_btw_stim)
         self.delay_btw_channels = ExtendedTimedelta(seconds=delay_btw_channels)
         self.repeats_per_channel = repeats_per_channel
-        self.parameter_grid = parameter_grid
 
         self.params_per_electrode = self.parameter_grid.total_combinations()
         self.parameters = self._create_parameters_factory()
@@ -417,7 +487,6 @@ class StimScan:
         self.stop_time = None
 
         if self.testing:
-            logger.info("[TESTING] Mode enabled — hardware classes will NOT be instantiated.")
             self._trigger_gen = _MockTriggerGen()
             self._intan = _MockIntan()
             self._db = None
@@ -432,8 +501,8 @@ class StimScan:
         self._params_per_site = {}
 
         logger.info("Initializing StimScan (testing=%s)", testing)
-        logger.info("  Experiment token: %s", fs_experiment.exp_name)
-        logger.info("  Allowed electrodes: %s", fs_experiment.electrodes)
+        logger.info("  Experiment token: %s", self.fs_experiment.exp_name)
+        logger.info("  Allowed electrodes: %s", self.fs_experiment.electrodes)
         logger.info("  Scan channels: %s", scan_channels)
         logger.info("  Delay between stims: %.2f s", delay_btw_stim)
         logger.info("  Delay between channels: %.2f s", delay_btw_channels)
