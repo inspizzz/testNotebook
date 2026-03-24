@@ -509,6 +509,23 @@ class StimScan:
         logger.info("  Repeats per channel: %d", repeats_per_channel)
         logger.info("  Total parameter combinations: %d", self.params_per_electrode)
 
+        # ---- Expected execution duration (always based on real timing) ----
+        stims_per_channel = self.params_per_electrode * repeats_per_channel
+        num_channels = len(scan_channels)
+        total_stim_time = stims_per_channel * delay_btw_stim * num_channels
+        total_channel_time = delay_btw_channels * max(num_channels - 1, 0)
+        expected_seconds = total_stim_time + total_channel_time
+        expected_td = timedelta(seconds=expected_seconds)
+        hours, remainder = divmod(int(expected_seconds), 3600)
+        minutes, secs = divmod(remainder, 60)
+        logger.info(
+            "  Expected execution duration (live): %dh %02dm %02ds  "
+            "(%d stims × %.1fs delay + %d channel gaps × %.1fs)",
+            hours, minutes, secs,
+            stims_per_channel * num_channels, delay_btw_stim,
+            max(num_channels - 1, 0), delay_btw_channels,
+        )
+
         # ---- Validate delay_btw_stim (docs recommend 1–10 s for fatigue) ----
         if delay_btw_stim < 1.0:
             logger.warning(
@@ -518,8 +535,8 @@ class StimScan:
             )
 
         # ---- Validate channels are in the allowed electrode list ----
-        if not np.all(np.isin(scan_channels, fs_experiment.electrodes)):
-            bad = set(scan_channels) - set(fs_experiment.electrodes)
+        if not np.all(np.isin(scan_channels, self.fs_experiment.electrodes)):
+            bad = set(scan_channels) - set(self.fs_experiment.electrodes)
             raise ValueError(
                 f"Channels {bad} are not in the allowed electrodes list for your experiment token."
             )
