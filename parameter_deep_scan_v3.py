@@ -187,8 +187,9 @@ class StimulationPlan:
     StimulationRounds covering every (electrode, amplitude, duration) pair.
 
     Grouping: connections are grouped by electrode index, then interleaved by
-    position so that round 0 takes the first entry from each electrode, round 1
-    takes the second, etc.  Within each round every active electrode shares
+    position.  Each interleave step is further split into **sub-rounds** so
+    that no two electrodes on the **same MEA** (electrode // 8) fire in the
+    same round.  Within each sub-round the active electrodes share
     ``trigger_key=0`` for parallel firing.
     """
 
@@ -199,26 +200,47 @@ class StimulationPlan:
         self.rounds: List[StimulationRound] = []
         self._build()
 
+    @staticmethod
+    def _mea_of(electrode: int) -> int:
+        """Return the MEA index (0-3) for a given electrode (0-31)."""
+        return electrode // 8
+
     def _build(self) -> None:
         by_electrode: Dict[int, List[ReliableConnection]] = {}
         for conn in self._connections:
             by_electrode.setdefault(conn.electrode_from, []).append(conn)
 
-        n_rounds = max(len(v) for v in by_electrode.values())
+        n_param_rounds = max(len(v) for v in by_electrode.values())
         self.rounds = []
 
-        for round_idx in range(n_rounds):
-            round_connections: Dict[int, ReliableConnection] = {}
+        for param_idx in range(n_param_rounds):
+            # Collect all electrodes active for this parameter index
+            active: Dict[int, ReliableConnection] = {}
             for electrode, conn_list in by_electrode.items():
-                if round_idx < len(conn_list):
-                    round_connections[electrode] = conn_list[round_idx]
-            self.rounds.append(
-                StimulationRound(
-                    round_index=round_idx,
-                    connections=round_connections,
-                    trigger_key=self.SHARED_TRIGGER_KEY,
+                if param_idx < len(conn_list):
+                    active[electrode] = conn_list[param_idx]
+
+            # Split into sub-rounds: at most ONE electrode per MEA per sub-round
+            sub_rounds: List[Dict[int, ReliableConnection]] = []
+            for electrode, conn in active.items():
+                mea = self._mea_of(electrode)
+                placed = False
+                for sr in sub_rounds:
+                    if mea not in {self._mea_of(e) for e in sr}:
+                        sr[electrode] = conn
+                        placed = True
+                        break
+                if not placed:
+                    sub_rounds.append({electrode: conn})
+
+            for sr in sub_rounds:
+                self.rounds.append(
+                    StimulationRound(
+                        round_index=len(self.rounds),
+                        connections=sr,
+                        trigger_key=self.SHARED_TRIGGER_KEY,
+                    )
                 )
-            )
 
         total_pairs = sum(len(r.connections) for r in self.rounds)
         logger.info(
@@ -234,7 +256,8 @@ class StimulationPlan:
                 e: f"{c.amplitude}uA/{c.duration}us"
                 for e, c in r.connections.items()
             }
-            logger.info("  Round %d: %s", r.round_index, electrodes_this_round)
+            meas_this_round = sorted({self._mea_of(e) for e in r.connections})
+            logger.info("  Round %d: %s  (MEAs: %s)", r.round_index, electrodes_this_round, meas_this_round)
 
 
 # ---------------------------------------------------------------------------
