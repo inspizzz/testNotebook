@@ -424,14 +424,10 @@ class StimScan:
         """
         self.testing = testing
 
-        # ---- Build Experiment (or mock) from token ----
-        if self.testing:
-            logger.info("[TESTING] Mode enabled — hardware classes will NOT be instantiated.")
-            self.fs_experiment = _MockExperiment(
-                exp_name=f"test_{token}", electrodes=list(range(128))
-            )
-        else:
-            self.fs_experiment = Experiment(token)
+        # ---- Build Experiment ----
+        # In testing mode the notebook's neuroplatform is the
+        # SimulatedOrganoid-backed stub, so Experiment is safe to create.
+        self.fs_experiment = Experiment(token)
 
         # ---- Coerce polarity ints → StimPolarity enums ----
         if polarities is not None:
@@ -486,12 +482,8 @@ class StimScan:
         self.start_time = None
         self.stop_time = None
 
-        if self.testing:
-            self._trigger_gen = _MockTriggerGen()
-            self._intan = _MockIntan()
-        else:
-            self._trigger_gen = TriggerController(booking_email)
-            self._intan = IntanSoftware()
+        self._trigger_gen = TriggerController(booking_email)
+        self._intan = IntanSoftware()
         self._db = Database()
 
         self._channels_per_trigger = {}
@@ -672,15 +664,12 @@ class StimScan:
                     )
             self._validate_no_duplicate_indices(params)
             needed_triggers = np.where(triggers_counter > 0)[0]
-            if self.testing:
-                self.loaders = [(needed_triggers, _MockLoader(params))]
-            else:
-                self.loaders = [
-                    (
-                        needed_triggers,
-                        StimParamLoader(params, self._intan, verbose=False),
-                    )
-                ]
+            self.loaders = [
+                (
+                    needed_triggers,
+                    StimParamLoader(params, self._intan, verbose=False),
+                )
+            ]
         elif self.mea_type == MEAType.MEA32:
             params_16 = []
             params_32 = []
@@ -701,22 +690,16 @@ class StimScan:
                 )
             self._validate_no_duplicate_indices(params_16 + params_32)
             needed_triggers = np.where(triggers_counter > 0)[0]
-            if self.testing:
-                self.loaders = [
-                    (needed_triggers, _MockLoader(params_16)),
-                    (needed_triggers, _MockLoader(params_32)),
-                ]
-            else:
-                self.loaders = [
-                    (
-                        needed_triggers,
-                        StimParamLoader(params_16, self._intan, verbose=False),
-                    ),
-                    (
-                        needed_triggers,
-                        StimParamLoader(params_32, self._intan, verbose=False),
-                    ),
-                ]
+            self.loaders = [
+                (
+                    needed_triggers,
+                    StimParamLoader(params_16, self._intan, verbose=False),
+                ),
+                (
+                    needed_triggers,
+                    StimParamLoader(params_32, self._intan, verbose=False),
+                ),
+            ]
 
         logger.debug(
             "Factory[%d]: built %d loader(s), needed triggers: %s",
