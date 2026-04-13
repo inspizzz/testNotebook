@@ -393,21 +393,16 @@ class ResponsiveElectrodeExperiment:
         self._output_dir = Path(output_dir)
         self._testing = testing
 
-        # ---- Build Experiment (or mock) from token ----
-        if self._testing:
-            logger.info("[TESTING] Mode enabled — hardware classes will NOT be instantiated.")
-            self._exp = _MockExperiment(
-                exp_name=f"test_{token}", electrodes=list(range(128))
-            )
-            self._intan = _MockIntan()
-            self._trigger_ctrl = _MockTriggerCtrl()
-        else:
-            logger.info("Creating Experiment (token=%s)...", token)
-            self._exp = Experiment(token)
-            logger.info("Connecting to IntanSoftware...")
-            self._intan = IntanSoftware()
-            logger.info("Connecting to TriggerController (booking_email=%s)...", booking_email)
-            self._trigger_ctrl = TriggerController(booking_email)
+        # ---- Build Experiment, Intan, TriggerController ----
+        # In testing mode the notebook's neuroplatform is the
+        # SimulatedOrganoid-backed stub, so these classes are safe to
+        # instantiate regardless of mode.
+        logger.info("Creating Experiment (token=%s)...", token)
+        self._exp = Experiment(token)
+        logger.info("Connecting to IntanSoftware...")
+        self._intan = IntanSoftware()
+        logger.info("Connecting to TriggerController (booking_email=%s)...", booking_email)
+        self._trigger_ctrl = TriggerController(booking_email)
 
         self._db = Database()
 
@@ -622,25 +617,16 @@ class ResponsiveElectrodeExperiment:
         for rep in range(self._n_stims):
             ts = datetime.now(timezone.utc)
 
-            if self._testing:
-                logger.debug(
-                    "  [TESTING] round=%d  rep=%04d/%04d  electrodes=%s  ts=%s",
-                    stim_round.round_index,
-                    rep + 1,
-                    self._n_stims,
-                    electrode_list,
-                    ts.isoformat(),
-                )
-            else:
-                self._trigger_ctrl.send(trigger_array)
-                logger.debug(
-                    "  round=%d  rep=%04d/%04d  electrodes=%s  ts=%s",
-                    stim_round.round_index,
-                    rep + 1,
-                    self._n_stims,
-                    electrode_list,
-                    ts.isoformat(),
-                )
+            self._trigger_ctrl.send(trigger_array)
+            logger.debug(
+                "  %sround=%d  rep=%04d/%04d  electrodes=%s  ts=%s",
+                "[TESTING] " if self._testing else "",
+                stim_round.round_index,
+                rep + 1,
+                self._n_stims,
+                electrode_list,
+                ts.isoformat(),
+            )
 
             for electrode in electrode_list:
                 conn = stim_round.connections[electrode]
@@ -674,37 +660,28 @@ class ResponsiveElectrodeExperiment:
     # ------------------------------------------------------------------
 
     def _send_stim_params(self, stim_params: List[StimParam]) -> None:
-        if self._testing:
-            logger.info(
-                "[TESTING] Skipping send_stimparam() for %d param(s).",
-                len(stim_params),
-            )
-            return
-
         logger.info(
-            "Sending %d StimParam(s) to Intan (wait %ds)...",
+            "Sending %d StimParam(s) to Intan%s...",
             len(stim_params),
-            self._param_send_wait,
+            "" if self._testing else f" (wait {self._param_send_wait}s)",
         )
         self._intan.send_stimparam(stim_params)
-        time.sleep(self._param_send_wait)
+        if not self._testing:
+            time.sleep(self._param_send_wait)
 
     def _disable_stim_params(
         self, stim_params: List[StimParam], round_index: int
     ) -> None:
-        if self._testing:
-            logger.info("[TESTING] Skipping disable_stim_params() for round %d.", round_index)
-            return
-
         logger.info(
-            "Disabling StimParams for round %d (wait %ds)...",
+            "Disabling StimParams for round %d%s...",
             round_index,
-            self._param_send_wait,
+            "" if self._testing else f" (wait {self._param_send_wait}s)",
         )
         for sp in stim_params:
             sp.enable = False
         self._intan.send_stimparam(stim_params)
-        time.sleep(self._param_send_wait)
+        if not self._testing:
+            time.sleep(self._param_send_wait)
 
     # ------------------------------------------------------------------
     # Database schema normalisation
