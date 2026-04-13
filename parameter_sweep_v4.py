@@ -489,11 +489,10 @@ class StimScan:
         if self.testing:
             self._trigger_gen = _MockTriggerGen()
             self._intan = _MockIntan()
-            self._db = None
         else:
             self._trigger_gen = TriggerController(booking_email)
             self._intan = IntanSoftware()
-            self._db = Database()
+        self._db = Database()
 
         self._channels_per_trigger = {}
         self._current_factory_id = None
@@ -866,7 +865,7 @@ class StimScan:
             total_stims = len(self._stim_history)
             logger.info("Total stimulations recorded: %d", total_stims)
 
-            # Save output files (always — stim_history; live only — spike_activity, triggers)
+            # Save output files (stim_history, spike_activity, triggers)
             self.save_results()
 
             logger.info("=" * 60)
@@ -881,9 +880,9 @@ class StimScan:
         """Fetch results from the database and save them to CSV files.
 
         Produces the same artifacts as the remote parameter_sweep_v2:
-            - stim_history.csv   — always (from local ``_stim_history``)
-            - spike_activity.csv — live runs only (``Database.get_spike_event``)
-            - triggers.csv       — live runs only (``Database.get_all_triggers``)
+            - stim_history.csv   — from local ``_stim_history``
+            - spike_activity.csv — ``Database.get_spike_event``
+            - triggers.csv       — ``Database.get_all_triggers``
 
         Args:
             output_dir: Directory to write the files into (created if missing).
@@ -906,14 +905,6 @@ class StimScan:
         stim_df.to_csv(stim_history_path)
         saved["stim_history"] = stim_history_path
         logger.info("Saved stimulation history  -> %s (%d rows)", stim_history_path, len(stim_df))
-
-        # In testing mode the database is unavailable — skip DB-dependent files.
-        if self.testing:
-            logger.warning(
-                "[TESTING] Skipping DB queries for spike_activity and triggers "
-                "(no live experiment was run)."
-            )
-            return saved
 
         exp_name = self.fs_experiment.exp_name
 
@@ -1019,10 +1010,6 @@ class StimScan:
             last_stim + timedelta(seconds=s_after),
         )
 
-        if self.testing:
-            logger.info("[TESTING] Skipping database spike event fetch for raster plot.")
-            return
-
         events = self._db.get_spike_event(
             first_stim - timedelta(seconds=s_before),
             last_stim + timedelta(seconds=s_after),
@@ -1115,10 +1102,6 @@ class StimScan:
 
     def plot_spike_count_per_stim(self):
         """Plots the spike count per minute for each channel."""
-        if self.testing:
-            logger.info("[TESTING] Skipping spike count plot — no database available.")
-            return
-
         spike_count_df = self._db.get_spike_count(
             self.start_time, self.stop_time, self.fs_experiment.exp_name
         )
