@@ -9,7 +9,7 @@ spike responses to electrical stimulation parameters.
 Network architecture
 --------------------
 - 4 MEAs x 8 electrodes = 32 electrodes (matches FinalSpark platform).
-- ``n_neurons_per_electrode`` neurons per electrode (default 16 -> 512 total).
+- ``n_neurons_per_electrode`` neurons per electrode (default 8 -> 256 total).
 - 80% excitatory (Regular Spiking) / 20% inhibitory (Fast Spiking).
 - Random within-MEA connectivity with distance-dependent probability.
 - No cross-MEA connections (organoids are physically isolated).
@@ -85,6 +85,9 @@ class SimulatedOrganoid:
     background_current : float
         Mean thalamic / noise current injected into every neuron
         at each timestep (produces spontaneous background activity).
+    synaptic_gain : float
+        Multiplier applied to post-synaptic current from firing
+        pre-synaptic neurons.  Lower values reduce cascade activity.
     stdp_enabled : bool
         Whether spike-timing-dependent plasticity is active.
     A_plus : float
@@ -101,21 +104,23 @@ class SimulatedOrganoid:
 
     def __init__(
         self,
-        n_neurons_per_electrode: int = 16,
+        n_neurons_per_electrode: int = 8,
         seed: int = 42,
         dt: float = 0.5,
-        connection_probability: float = 0.10,
-        background_current: float = 2.0,
+        connection_probability: float = 0.03,
+        background_current: float = 0.3,
+        synaptic_gain: float = 3.0,
         stdp_enabled: bool = True,
         A_plus: float = 0.005,
         A_minus: float = 0.005,
         tau_plus: float = 20.0,
         tau_minus: float = 20.0,
-        w_max: float = 1.0,
+        w_max: float = 0.5,
     ) -> None:
         self._rng = np.random.RandomState(seed)
         self._dt = dt
         self._bg_current = background_current
+        self._syn_gain = synaptic_gain
         self._n_per_elec = n_neurons_per_electrode
         self._n_total = N_ELECTRODES * n_neurons_per_electrode
 
@@ -185,8 +190,11 @@ class SimulatedOrganoid:
             elec_i = mea_elecs[:, None]
             elec_j = mea_elecs[None, :]
             dist = np.abs(elec_i - elec_j).astype(float)
-            # Distance-dependent connection probability (exponential decay)
-            prob = base_prob * np.exp(-dist / (ELECTRODES_PER_MEA / 4.0))
+            # Distance-dependent connection probability (steep exponential
+            # decay so only nearby electrodes have meaningful connectivity).
+            # With length_scale=1.0, P drops to ~5% of base at dist=3.
+            length_scale = 1.0
+            prob = base_prob * np.exp(-dist / length_scale)
             np.fill_diagonal(prob, 0.0)
 
             connected = rng.rand(n_mea, n_mea) < prob
@@ -197,8 +205,8 @@ class SimulatedOrganoid:
 
             w = np.where(
                 self._is_excitatory[pre_global],
-                rng.rand(len(pre_global)) * 0.5,    # excitatory: [0, 0.5]
-                -rng.rand(len(pre_global)) * 1.0,    # inhibitory: [-1, 0]
+                rng.rand(len(pre_global)) * 0.3,    # excitatory: [0, 0.3]
+                -rng.rand(len(pre_global)) * 0.8,   # inhibitory: [-0.8, 0]
             )
 
             rows.append(pre_global)
@@ -353,7 +361,7 @@ class SimulatedOrganoid:
                 # Synaptic propagation (use current W; STDP changes take
                 # effect next stimulate call via _rebuild_W)
                 syn_input = np.asarray(W[fired].sum(axis=0)).flatten()
-                v += syn_input * 20.0
+                v += syn_input * self._syn_gain
 
                 # Reset
                 v[fired] = c[fired]
