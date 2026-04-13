@@ -82,6 +82,10 @@ class SimulatedOrganoid:
     connection_probability : float
         Base probability of a synapse between two neurons on the
         same MEA.  Actual probability decays with electrode distance.
+    max_connection_dist : int
+        Hard electrode-distance cutoff.  Neurons on electrodes
+        farther apart than this have zero connection probability,
+        preventing long-range cascade chains.
     background_current : float
         Mean thalamic / noise current injected into every neuron
         at each timestep (produces spontaneous background activity).
@@ -108,9 +112,10 @@ class SimulatedOrganoid:
         seed: int = 42,
         dt: float = 0.5,
         connection_probability: float = 0.03,
-        background_current: float = 0.3,
-        synaptic_gain: float = 3.0,
-        stdp_enabled: bool = True,
+        max_connection_dist: int = 2,
+        background_current: float = 0.15,
+        synaptic_gain: float = 1.5,
+        stdp_enabled: bool = False,
         A_plus: float = 0.005,
         A_minus: float = 0.005,
         tau_plus: float = 20.0,
@@ -121,6 +126,7 @@ class SimulatedOrganoid:
         self._dt = dt
         self._bg_current = background_current
         self._syn_gain = synaptic_gain
+        self._max_conn_dist = max_connection_dist
         self._n_per_elec = n_neurons_per_electrode
         self._n_total = N_ELECTRODES * n_neurons_per_electrode
 
@@ -140,7 +146,7 @@ class SimulatedOrganoid:
         self._neuron_mea = self._neuron_electrode // ELECTRODES_PER_MEA
 
         self._build_neuron_parameters()
-        self._build_connectivity(connection_probability)
+        self._build_connectivity(connection_probability, max_connection_dist)
 
         # Persistent state so successive stimulations see ongoing dynamics
         self._v = np.full(self._n_total, -65.0)
@@ -170,8 +176,13 @@ class SimulatedOrganoid:
         self._c = np.where(is_excitatory, -65.0 + 15.0 * re ** 2, -65.0)
         self._d = np.where(is_excitatory, 8.0 - 6.0 * re ** 2, 2.0)
 
-    def _build_connectivity(self, base_prob: float) -> None:
-        """Build sparse within-MEA synaptic weight matrix."""
+    def _build_connectivity(self, base_prob: float, max_dist: int = 2) -> None:
+        """Build sparse within-MEA synaptic weight matrix.
+
+        Connections are only possible between neurons whose electrodes
+        are at most *max_dist* apart, preventing long-range multi-hop
+        cascade chains across the entire MEA.
+        """
         N = self._n_total
         rng = self._rng
         elec = self._neuron_electrode
@@ -186,15 +197,14 @@ class SimulatedOrganoid:
                 continue
 
             mea_elecs = elec[idx]
-            # Distance (in electrode-index units) between every pair
             elec_i = mea_elecs[:, None]
             elec_j = mea_elecs[None, :]
             dist = np.abs(elec_i - elec_j).astype(float)
-            # Distance-dependent connection probability (steep exponential
-            # decay so only nearby electrodes have meaningful connectivity).
-            # With length_scale=1.0, P drops to ~5% of base at dist=3.
-            length_scale = 1.0
-            prob = base_prob * np.exp(-dist / length_scale)
+
+            # Hard cutoff: zero probability beyond max_dist electrodes
+            prob = np.where(dist <= max_dist,
+                            base_prob * np.exp(-dist),
+                            0.0)
             np.fill_diagonal(prob, 0.0)
 
             connected = rng.rand(n_mea, n_mea) < prob
