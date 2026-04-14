@@ -111,10 +111,10 @@ class SimulatedOrganoid:
         n_neurons_per_electrode: int = 8,
         seed: int = 42,
         dt: float = 0.5,
-        connection_probability: float = 0.03,
+        connection_probability: float = 0.06,
         max_connection_dist: int = 2,
-        background_current: float = 0.15,
-        synaptic_gain: float = 1.5,
+        background_current: float = 0.5,
+        synaptic_gain: float = 6.0,
         stdp_enabled: bool = False,
         A_plus: float = 0.005,
         A_minus: float = 0.005,
@@ -215,7 +215,7 @@ class SimulatedOrganoid:
 
             w = np.where(
                 self._is_excitatory[pre_global],
-                rng.rand(len(pre_global)) * 0.3,    # excitatory: [0, 0.3]
+                rng.rand(len(pre_global)) * 0.5,    # excitatory: [0, 0.5]
                 -rng.rand(len(pre_global)) * 0.8,   # inhibitory: [-0.8, 0]
             )
 
