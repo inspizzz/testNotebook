@@ -78,15 +78,24 @@ class PathwayProfile:
     Waveform shape parameters are fixed per pathway so that spikes from the
     same pathway cluster together visually, while different pathways produce
     recognizably different waveform profiles.
+
+    Shape parameters (all per-pathway lists, one entry per path):
+        neg_widths     – sigma of the negative lobe Gaussian (ms)
+        pos_widths     – sigma of the positive lobe Gaussian (ms)
+        pos_delays     – time from neg trough to pos peak (ms)
+        peak_ratios    – positive-peak / negative-trough amplitude ratio
+        ahp_amps       – after-hyperpolarization amplitude as fraction of neg
     """
 
     latencies_ms: List[float]
     jitter_std_ms: List[float]
     reliabilities: List[float]
     spontaneous_rate: float = 0.05
-    waveform_widths: List[float] = field(default_factory=list)
-    waveform_peak_ratios: List[float] = field(default_factory=list)
-    waveform_asymmetries: List[float] = field(default_factory=list)
+    neg_widths: List[float] = field(default_factory=list)
+    pos_widths: List[float] = field(default_factory=list)
+    pos_delays: List[float] = field(default_factory=list)
+    peak_ratios: List[float] = field(default_factory=list)
+    ahp_amps: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -313,21 +322,27 @@ class SimulatedOrganoid:
                 jitters.append(float(rng.uniform(0.3, 1.0)))
                 reliabilities.append(float(rng.uniform(0.15, 0.40)))
 
-            widths: List[float] = []
-            peak_ratios: List[float] = []
-            asymmetries: List[float] = []
+            neg_w: List[float] = []
+            pos_w: List[float] = []
+            pos_d: List[float] = []
+            pk_r: List[float] = []
+            ahp_a: List[float] = []
             for _ in range(n_paths):
-                widths.append(float(rng.uniform(0.7, 1.4)))
-                peak_ratios.append(float(rng.uniform(0.4, 1.2)))
-                asymmetries.append(float(rng.uniform(0.8, 1.3)))
+                neg_w.append(float(rng.uniform(0.12, 0.40)))
+                pos_w.append(float(rng.uniform(0.15, 0.50)))
+                pos_d.append(float(rng.uniform(0.25, 0.80)))
+                pk_r.append(float(rng.uniform(0.3, 1.4)))
+                ahp_a.append(float(rng.uniform(0.0, 0.30)))
 
             profiles[(stim_e, resp_e)] = PathwayProfile(
                 latencies_ms=latencies,
                 jitter_std_ms=jitters,
                 reliabilities=reliabilities,
-                waveform_widths=widths,
-                waveform_peak_ratios=peak_ratios,
-                waveform_asymmetries=asymmetries,
+                neg_widths=neg_w,
+                pos_widths=pos_w,
+                pos_delays=pos_d,
+                peak_ratios=pk_r,
+                ahp_amps=ahp_a,
             )
 
         self._pathway_profiles = profiles
@@ -492,9 +507,10 @@ class SimulatedOrganoid:
         # the stimulated electrode itself.
         out_times: List[float] = []
         out_elecs: List[int] = []
-        # Per-spike waveform shape params (width, peak_ratio, asymmetry).
+        # Per-spike waveform shape params:
+        #   (neg_width, pos_width, pos_delay, peak_ratio, ahp_amp)
         # None = use default shape (self-electrode / spontaneous spikes).
-        out_shapes: List[Optional[Tuple[float, float, float]]] = []
+        out_shapes: List[Optional[Tuple[float, float, float, float, float]]] = []
 
         for resp_e in responding_electrodes:
             if resp_e == electrode:
@@ -521,9 +537,11 @@ class SimulatedOrganoid:
                         out_times.append(round(t_ms, 2))
                         out_elecs.append(resp_e)
                         out_shapes.append((
-                            profile.waveform_widths[path_idx],
-                            profile.waveform_peak_ratios[path_idx],
-                            profile.waveform_asymmetries[path_idx],
+                            profile.neg_widths[path_idx],
+                            profile.pos_widths[path_idx],
+                            profile.pos_delays[path_idx],
+                            profile.peak_ratios[path_idx],
+                            profile.ahp_amps[path_idx],
                         ))
 
             if self._rng.rand() < profile.spontaneous_rate:
@@ -550,7 +568,7 @@ class SimulatedOrganoid:
         self,
         time_arr: np.ndarray,
         elec_arr: np.ndarray,
-        shape_params: Optional[List[Optional[Tuple[float, float, float]]]] = None,
+        shape_params: Optional[List[Optional[Tuple[float, float, float, float, float]]]] = None,
     ) -> SimulationResult:
         """Convert raw neuron spikes into electrode-level results (vectorized)."""
         if len(time_arr) == 0:
@@ -575,7 +593,7 @@ class SimulatedOrganoid:
 
         # Resolve per-event shape params: pick the first input row that
         # maps to each unique key (via the inverse mapping).
-        resolved_shapes: List[Optional[Tuple[float, float, float]]] = []
+        resolved_shapes: List[Optional[Tuple[float, float, float, float, float]]] = []
         if shape_params is not None:
             first_for_key: Dict[int, int] = {}
             for src_idx, key_idx in enumerate(inverse):
@@ -598,55 +616,63 @@ class SimulatedOrganoid:
     def _generate_waveforms_batch(
         self,
         peak_uvs: np.ndarray,
-        shape_params: List[Optional[Tuple[float, float, float]]],
+        shape_params: List[Optional[Tuple[float, float, float, float, float]]],
     ) -> List[List[float]]:
-        """Generate realistic biphasic waveforms with per-pathway shape variation and noise.
+        """Generate realistic biphasic waveforms with per-pathway shape variation.
 
-        Each waveform has:
-        - A negative lobe followed by a positive lobe (biphasic extracellular spike)
-        - Per-pathway shape (width, peak ratio, asymmetry) so different pathways
-          produce recognizably different clusters
-        - Per-trial amplitude jitter (~15%) and width jitter (~8%)
-        - Additive Gaussian noise (~4 uV std) matching real MEA recording floor
+        Shape tuple: (neg_width, pos_width, pos_delay, peak_ratio, ahp_amp).
+        Default (spontaneous / same-electrode): (0.25, 0.30, 0.45, 0.8, 0.0).
+
+        Per-trial jitter is applied to every parameter so repeated spikes
+        from the same pathway still show natural variation, while different
+        pathways are recognisably distinct.
         """
         n = WAVEFORM_N_SAMPLES
         rng = self._rng
         n_spikes = len(peak_uvs)
-        t_base = np.linspace(-1.0, 2.0, n)  # ms, matching WAVEFORM_DURATION_MS
+        t_base = np.linspace(-1.0, 2.0, n)
 
         all_waveforms = np.empty((n_spikes, n), dtype=np.float64)
 
         for i in range(n_spikes):
             sp = shape_params[i]
             if sp is not None:
-                w_scale, peak_ratio, asym = sp
+                nw, pw, pd, pr, ahp = sp
             else:
-                w_scale, peak_ratio, asym = 1.0, 0.8, 1.0
+                nw, pw, pd, pr, ahp = 0.25, 0.30, 0.45, 0.8, 0.0
 
-            # Per-trial jitter on the pathway's characteristic shape
-            w_trial = w_scale * (1.0 + rng.randn() * 0.08)
+            # Per-trial jitter on each shape parameter
+            nw_t = nw * (1.0 + rng.randn() * 0.10)
+            pw_t = pw * (1.0 + rng.randn() * 0.10)
+            pd_t = pd * (1.0 + rng.randn() * 0.08)
+            pr_t = pr * (1.0 + rng.randn() * 0.10)
+            ahp_t = max(0.0, ahp * (1.0 + rng.randn() * 0.20))
             amp_trial = peak_uvs[i] * (1.0 + rng.randn() * 0.15)
 
-            # Negative lobe: Gaussian centred at t=0 (spike trough)
-            neg_sigma = 0.25 * w_trial
-            neg_lobe = -np.exp(-0.5 * (t_base / neg_sigma) ** 2)
+            # Negative lobe: Gaussian at t=0
+            neg_lobe = -np.exp(-0.5 * (t_base / max(nw_t, 0.05)) ** 2)
 
-            # Positive lobe: Gaussian shifted rightward, scaled by peak_ratio
-            pos_centre = 0.45 * asym
-            pos_sigma = 0.30 * w_trial
-            pos_lobe = peak_ratio * np.exp(
-                -0.5 * ((t_base - pos_centre) / pos_sigma) ** 2
+            # Positive lobe: Gaussian shifted by pos_delay
+            pos_lobe = pr_t * np.exp(
+                -0.5 * ((t_base - pd_t) / max(pw_t, 0.05)) ** 2
             )
 
-            template = neg_lobe + pos_lobe
-            # Normalise so the negative trough is -1
+            # After-hyperpolarization: small negative dip after positive lobe
+            ahp_centre = pd_t + 2.5 * pw_t
+            ahp_sigma = pw_t * 0.8
+            ahp_lobe = -ahp_t * np.exp(
+                -0.5 * ((t_base - ahp_centre) / max(ahp_sigma, 0.05)) ** 2
+            )
+
+            template = neg_lobe + pos_lobe + ahp_lobe
+
             trough = np.min(template)
             if trough != 0.0:
                 template /= -trough
 
             waveform = amp_trial * template
 
-            # Additive recording noise (~4 uV std)
+            # Additive recording noise (~4 µV std)
             waveform += rng.randn(n) * 4.0
 
             all_waveforms[i] = waveform
