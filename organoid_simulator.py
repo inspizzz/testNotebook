@@ -9,7 +9,7 @@ spike responses to electrical stimulation parameters.
 Network architecture
 --------------------
 - 4 MEAs x 8 electrodes = 32 electrodes (matches FinalSpark platform).
-- ``n_neurons_per_electrode`` neurons per electrode (default 8 -> 256 total).
+- ``n_neurons_per_electrode`` neurons per electrode (default 16 -> 512 total).
 - 80% excitatory (Regular Spiking) / 20% inhibitory (Fast Spiking).
 - Random within-MEA connectivity with distance-dependent probability.
 - No cross-MEA connections (organoids are physically isolated).
@@ -108,13 +108,13 @@ class SimulatedOrganoid:
 
     def __init__(
         self,
-        n_neurons_per_electrode: int = 8,
+        n_neurons_per_electrode: int = 16,
         seed: int = 42,
         dt: float = 0.5,
-        connection_probability: float = 0.06,
+        connection_probability: float = 0.15,
         max_connection_dist: int = 2,
-        background_current: float = 0.5,
-        synaptic_gain: float = 6.0,
+        background_current: float = 1.0,
+        synaptic_gain: float = 15.0,
         stdp_enabled: bool = False,
         A_plus: float = 0.005,
         A_minus: float = 0.005,
