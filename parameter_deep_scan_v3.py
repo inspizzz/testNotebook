@@ -35,6 +35,8 @@ from neuroplatform import (
     StimParam,
     StimPolarity,
     TriggerController,
+    datetime_now,
+    wait,
 )
 
 try:
@@ -487,7 +489,7 @@ class ResponsiveElectrodeExperiment:
                     "Could not start experiment — is another session already running?"
                 )
 
-            experiment_start = datetime.now(timezone.utc)
+            experiment_start = datetime_now()
             logger.info("Experiment started: %s", self._exp.exp_name)
             logger.info("Start time: %s", experiment_start.isoformat())
 
@@ -502,7 +504,7 @@ class ResponsiveElectrodeExperiment:
 
             self._run_all_rounds()
 
-            experiment_stop = datetime.now(timezone.utc)
+            experiment_stop = datetime_now()
             logger.info("Experiment stop time: %s", experiment_stop.isoformat())
 
         finally:
@@ -615,7 +617,7 @@ class ResponsiveElectrodeExperiment:
         electrode_list = list(stim_round.connections.keys())
 
         for rep in range(self._n_stims):
-            ts = datetime.now(timezone.utc)
+            ts = datetime_now()
 
             self._trigger_ctrl.send(trigger_array)
             logger.debug(
@@ -644,8 +646,7 @@ class ResponsiveElectrodeExperiment:
                     )
                 )
 
-            if not self._testing:
-                time.sleep(self._delay)
+            wait(self._delay)
 
         logger.info(
             "  Round %d complete: %d reps × %d electrode(s)%s",
@@ -661,27 +662,25 @@ class ResponsiveElectrodeExperiment:
 
     def _send_stim_params(self, stim_params: List[StimParam]) -> None:
         logger.info(
-            "Sending %d StimParam(s) to Intan%s...",
+            "Sending %d StimParam(s) to Intan (wait %ss)...",
             len(stim_params),
-            "" if self._testing else f" (wait {self._param_send_wait}s)",
+            self._param_send_wait,
         )
         self._intan.send_stimparam(stim_params)
-        if not self._testing:
-            time.sleep(self._param_send_wait)
+        wait(self._param_send_wait)
 
     def _disable_stim_params(
         self, stim_params: List[StimParam], round_index: int
     ) -> None:
         logger.info(
-            "Disabling StimParams for round %d%s...",
+            "Disabling StimParams for round %d (wait %ss)...",
             round_index,
-            "" if self._testing else f" (wait {self._param_send_wait}s)",
+            self._param_send_wait,
         )
         for sp in stim_params:
             sp.enable = False
         self._intan.send_stimparam(stim_params)
-        if not self._testing:
-            time.sleep(self._param_send_wait)
+        wait(self._param_send_wait)
 
     # ------------------------------------------------------------------
     # Database schema normalisation
