@@ -688,49 +688,25 @@ class ResponsiveElectrodeExperiment:
 
     @staticmethod
     def _normalise_trigger_df(df: pd.DataFrame) -> pd.DataFrame:
-        """Normalise trigger DataFrame to consistent schema:
-        Time (UTC datetime64), trigger (int), status (str), tag (float)."""
+        """Ensure trigger DataFrame has UTC-aware ``_time`` and integer ``up``.
+
+        The canonical schema (matching ``Database.get_all_triggers()``) is:
+        ``_time`` (UTC datetime), ``_value`` (float), ``trigger`` (int),
+        ``up`` (int 0/1).
+        """
         df = df.copy()
         df.columns = [c.strip() for c in df.columns]
-
-        if "_time" in df.columns and "up" in df.columns:
-            df = df.rename(columns={"_time": "Time", "_value": "tag"})
-            try:
-                up_int = df["up"].astype(float).astype(int)
-            except (ValueError, TypeError):
-                up_int = df["up"]
-            df["status"] = up_int.map({1: "up", 0: "down"})
-            n_unmapped = df["status"].isna().sum()
-            if n_unmapped > 0:
-                logger.warning(
-                    "Trigger normalisation: %d row(s) had unexpected 'up' values. "
-                    "Unique values seen: %s",
-                    n_unmapped,
-                    df["up"].unique().tolist(),
-                )
-            logger.info(
-                "Trigger schema: real (_time/up) -> normalised.  "
-                "up-events: %d  down-events: %d  unmapped: %d",
-                (df["status"] == "up").sum(),
-                (df["status"] == "down").sum(),
-                n_unmapped,
-            )
-        elif "Time" in df.columns and "status" in df.columns:
-            if "tag" not in df.columns:
-                df["tag"] = float("nan")
-            logger.info(
-                "Trigger schema: documented (Time/status) -> no change needed.  "
-                "up-events: %d  down-events: %d",
-                (df["status"] == "up").sum(),
-                (df["status"] == "down").sum(),
-            )
-        else:
-            logger.warning(
-                "Unrecognised trigger DataFrame schema; columns present: %s",
-                list(df.columns),
-            )
-
-        df["Time"] = pd.to_datetime(df["Time"], utc=True)
+        df["_time"] = pd.to_datetime(df["_time"], utc=True)
+        try:
+            df["up"] = df["up"].astype(float).astype(int)
+        except (ValueError, TypeError):
+            pass
+        up_count = (df["up"] == 1).sum()
+        down_count = (df["up"] == 0).sum()
+        logger.info(
+            "Trigger schema: _time/up.  up-events: %d  down-events: %d",
+            up_count, down_count,
+        )
         return df
 
     @staticmethod
@@ -760,7 +736,7 @@ class ResponsiveElectrodeExperiment:
             logger.warning("Experiment times not set; skipping DB fetch.")
             return (
                 pd.DataFrame(columns=["Time", "channel", "Amplitude"]),
-                pd.DataFrame(columns=["Time", "trigger", "status", "tag"]),
+                pd.DataFrame(columns=["_time", "_value", "trigger", "up"]),
             )
 
         buffered_stop = stop + timedelta(seconds=self._spike_window)
@@ -786,7 +762,7 @@ class ResponsiveElectrodeExperiment:
             logger.info("  Triggers retrieved: %d rows", len(trigger_df))
         except Exception as exc:
             logger.warning("Could not retrieve triggers: %s", exc)
-            trigger_df = pd.DataFrame(columns=["Time", "trigger", "status", "tag"])
+            trigger_df = pd.DataFrame(columns=["_time", "_value", "trigger", "up"])
 
         return spike_df, trigger_df
 
@@ -814,18 +790,18 @@ class ResponsiveElectrodeExperiment:
             return []
 
         trigger_df = trigger_df.copy()
-        if "status" not in trigger_df.columns:
+        if "up" not in trigger_df.columns:
             logger.warning(
-                "trigger_df is missing the 'status' column after normalisation. "
+                "trigger_df is missing the 'up' column. "
                 "Available columns: %s  — skipping waveform extraction.",
                 list(trigger_df.columns),
             )
             return []
 
-        up_triggers = trigger_df[trigger_df["status"] == "up"].copy()
+        up_triggers = trigger_df[trigger_df["up"] == 1].copy()
         if up_triggers.empty:
             logger.warning(
-                "No trigger 'up' events found in trigger_df; "
+                "No trigger up-events (up==1) found in trigger_df; "
                 "skipping waveform extraction."
             )
             return []
@@ -845,10 +821,10 @@ class ResponsiveElectrodeExperiment:
         skipped_waveforms: int = 0
 
         for _, trig_row in up_triggers.iterrows():
-            trig_time: datetime = trig_row["Time"]
+            trig_time: datetime = trig_row["_time"]
             trig_tag: int = (
-                int(trig_row["tag"])
-                if pd.notna(trig_row.get("tag"))
+                int(trig_row["_value"])
+                if pd.notna(trig_row.get("_value"))
                 else -1
             )
             window_end: datetime = trig_time + response_window_td
