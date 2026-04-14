@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy import sparse
@@ -51,6 +51,8 @@ WAVEFORM_DURATION_MS = 3.0  # -1 ms to +2 ms around spike peak
 #   Fast Spiking:     a=0.1,  b=0.2, c=-65, d=2
 EXCITATORY_FRACTION = 0.8
 
+MIN_CROSS_ELECTRODE_LATENCY_MS = 5.0
+
 
 # ---------------------------------------------------------------------------
 # Result container
@@ -63,6 +65,21 @@ class SimulationResult:
     spike_channels: List[int] = field(default_factory=list)
     spike_amplitudes_uv: List[float] = field(default_factory=list)
     waveforms: List[List[float]] = field(default_factory=list)
+
+
+@dataclass
+class PathwayProfile:
+    """Describes the discrete neural pathways between an electrode pair.
+
+    Each pathway produces a tight cluster of spike times (a vertical line
+    on a raster plot) at a characteristic latency, matching the multi-path
+    response patterns observed in real organoid recordings.
+    """
+
+    latencies_ms: List[float]
+    jitter_std_ms: List[float]
+    reliabilities: List[float]
+    spontaneous_rate: float = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +257,63 @@ class SimulatedOrganoid:
             (self._W_data.copy(), (self._W_row, self._W_col)), shape=(N, N)
         )
 
+        self._build_pathway_profiles()
+
+    # ------------------------------------------------------------------
+    # Pathway profiles
+    # ------------------------------------------------------------------
+
+    def _build_pathway_profiles(self) -> None:
+        """Pre-compute multi-path latency profiles for connected electrode pairs.
+
+        A pair (stim, resp) is "connected" when at least one synapse exists
+        from a neuron on *stim* to a neuron on *resp*.  Each connected pair
+        gets 1-3 discrete pathways with characteristic latency, jitter, and
+        reliability drawn to match patterns observed in real organoid data.
+        """
+        rng = self._rng
+        elec = self._neuron_electrode
+
+        pre_elecs = elec[self._W_row]
+        post_elecs = elec[self._W_col]
+        connected_pairs = set(zip(pre_elecs.tolist(), post_elecs.tolist()))
+        connected_pairs = {(a, b) for a, b in connected_pairs if a != b}
+
+        n_paths_weights = [0.50, 0.35, 0.15]  # P(1 path), P(2), P(3)
+
+        profiles: Dict[Tuple[int, int], PathwayProfile] = {}
+        for stim_e, resp_e in connected_pairs:
+            n_paths = rng.choice([1, 2, 3], p=n_paths_weights)
+
+            latencies: List[float] = []
+            jitters: List[float] = []
+            reliabilities: List[float] = []
+
+            lat = float(rng.uniform(10.0, 25.0))
+            latencies.append(lat)
+            jitters.append(float(rng.uniform(0.3, 1.0)))
+            reliabilities.append(float(rng.uniform(0.70, 0.95)))
+
+            if n_paths >= 2:
+                lat = lat + float(rng.uniform(5.0, 15.0))
+                latencies.append(lat)
+                jitters.append(float(rng.uniform(0.3, 1.0)))
+                reliabilities.append(float(rng.uniform(0.30, 0.70)))
+
+            if n_paths >= 3:
+                lat = lat + float(rng.uniform(5.0, 12.0))
+                latencies.append(lat)
+                jitters.append(float(rng.uniform(0.3, 1.0)))
+                reliabilities.append(float(rng.uniform(0.15, 0.40)))
+
+            profiles[(stim_e, resp_e)] = PathwayProfile(
+                latencies_ms=latencies,
+                jitter_std_ms=jitters,
+                reliabilities=reliabilities,
+            )
+
+        self._pathway_profiles = profiles
+
     # ------------------------------------------------------------------
     # Stimulation
     # ------------------------------------------------------------------
@@ -386,16 +460,59 @@ class SimulatedOrganoid:
 
         step_arr = np.concatenate(all_fired_steps)
         neuron_arr = np.concatenate(all_fired_neurons)
-        time_arr = step_arr.astype(float) * dt
 
         # Only keep spikes from the stimulated MEA
         elec_arr = self._neuron_electrode[neuron_arr]
         mea_arr = elec_arr // ELECTRODES_PER_MEA
         same_mea = mea_arr == stim_mea
-        time_arr = time_arr[same_mea]
         elec_arr = elec_arr[same_mea]
 
-        return self._extract_results_vectorized(time_arr, elec_arr)
+        responding_electrodes = set(elec_arr.tolist())
+
+        # Replace Izhikevich timing with pathway-sampled latencies for
+        # cross-electrode responses; keep Izhikevich timing only for
+        # the stimulated electrode itself.
+        out_times: List[float] = []
+        out_elecs: List[int] = []
+
+        for resp_e in responding_electrodes:
+            if resp_e == electrode:
+                # Self-electrode: keep Izhikevich times (with floor)
+                mask = elec_arr == resp_e
+                raw_times = step_arr.astype(float)[same_mea][mask] * dt
+                for t_ms in raw_times:
+                    out_times.append(max(t_ms, 0.0))
+                    out_elecs.append(resp_e)
+                continue
+
+            profile = self._pathway_profiles.get((electrode, resp_e))
+            if profile is None:
+                continue
+
+            for path_idx in range(len(profile.latencies_ms)):
+                if self._rng.rand() < profile.reliabilities[path_idx]:
+                    t_ms = float(
+                        profile.latencies_ms[path_idx]
+                        + self._rng.randn() * profile.jitter_std_ms[path_idx]
+                    )
+                    t_ms = max(t_ms, MIN_CROSS_ELECTRODE_LATENCY_MS)
+                    if t_ms <= window_ms:
+                        out_times.append(round(t_ms, 2))
+                        out_elecs.append(resp_e)
+
+            if self._rng.rand() < profile.spontaneous_rate:
+                t_ms = float(self._rng.uniform(40.0, 95.0))
+                if t_ms <= window_ms:
+                    out_times.append(round(t_ms, 2))
+                    out_elecs.append(resp_e)
+
+        if not out_times:
+            return SimulationResult()
+
+        return self._extract_results_vectorized(
+            np.array(out_times, dtype=float),
+            np.array(out_elecs, dtype=int),
+        )
 
     # ------------------------------------------------------------------
     # Result extraction
