@@ -19,6 +19,8 @@ from neuroplatform import (
     Experiment,
     StimPolarity,
     StimShape,
+    datetime_now,
+    wait,
 )
 
 try:
@@ -734,7 +736,7 @@ class StimScan:
                     params_data_dict["param_id"] = self._current_factory_id
                     params_data_dict["channel"] = channels
 
-                    stim_time = datetime.now(UTC)
+                    stim_time = datetime_now()
                     self._stim_history[stim_time] = params_data_dict
 
                     self._trigger_gen.send(triggers)
@@ -747,16 +749,14 @@ class StimScan:
                         channels,
                         stim_time.isoformat(),
                     )
-                    if not self.testing:
-                        sleep(self.delay_btw_stim.as_seconds())
+                    wait(self.delay_btw_stim.as_seconds())
 
-                if not self.testing:
-                    logger.debug(
-                        "Channel delay (%.2f s) after trigger %d",
-                        self.delay_btw_channels.as_seconds(),
-                        trigger,
-                    )
-                    sleep(self.delay_btw_channels.as_seconds())
+                logger.debug(
+                    "Channel delay (%.2f s) after trigger %d",
+                    self.delay_btw_channels.as_seconds(),
+                    trigger,
+                )
+                wait(self.delay_btw_channels.as_seconds())
 
             # Disable all parameters on this loader when done
             # (FinalSpark docs: always disable params after use)
@@ -784,7 +784,7 @@ class StimScan:
         try:
             if self.fs_experiment.start():
                 logger.info("Experiment started: %s", self.fs_experiment.exp_name)
-                self.start_time = datetime.now(UTC)
+                self.start_time = datetime_now()
                 logger.info("Start time: %s", self.start_time.isoformat())
 
                 # Disable variable threshold for stable event detection during scan
@@ -838,7 +838,7 @@ class StimScan:
             logger.info("Stopping experiment.")
             self.fs_experiment.stop()
 
-            self.stop_time = datetime.now(UTC)
+            self.stop_time = datetime_now()
             logger.info("Stop time: %s", self.stop_time.isoformat())
 
             if self.start_time is not None:
