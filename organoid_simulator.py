@@ -74,12 +74,19 @@ class PathwayProfile:
     Each pathway produces a tight cluster of spike times (a vertical line
     on a raster plot) at a characteristic latency, matching the multi-path
     response patterns observed in real organoid recordings.
+
+    Waveform shape parameters are fixed per pathway so that spikes from the
+    same pathway cluster together visually, while different pathways produce
+    recognizably different waveform profiles.
     """
 
     latencies_ms: List[float]
     jitter_std_ms: List[float]
     reliabilities: List[float]
     spontaneous_rate: float = 0.05
+    waveform_widths: List[float] = field(default_factory=list)
+    waveform_peak_ratios: List[float] = field(default_factory=list)
+    waveform_asymmetries: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -306,10 +313,21 @@ class SimulatedOrganoid:
                 jitters.append(float(rng.uniform(0.3, 1.0)))
                 reliabilities.append(float(rng.uniform(0.15, 0.40)))
 
+            widths: List[float] = []
+            peak_ratios: List[float] = []
+            asymmetries: List[float] = []
+            for _ in range(n_paths):
+                widths.append(float(rng.uniform(0.7, 1.4)))
+                peak_ratios.append(float(rng.uniform(0.4, 1.2)))
+                asymmetries.append(float(rng.uniform(0.8, 1.3)))
+
             profiles[(stim_e, resp_e)] = PathwayProfile(
                 latencies_ms=latencies,
                 jitter_std_ms=jitters,
                 reliabilities=reliabilities,
+                waveform_widths=widths,
+                waveform_peak_ratios=peak_ratios,
+                waveform_asymmetries=asymmetries,
             )
 
         self._pathway_profiles = profiles
@@ -474,15 +492,18 @@ class SimulatedOrganoid:
         # the stimulated electrode itself.
         out_times: List[float] = []
         out_elecs: List[int] = []
+        # Per-spike waveform shape params (width, peak_ratio, asymmetry).
+        # None = use default shape (self-electrode / spontaneous spikes).
+        out_shapes: List[Optional[Tuple[float, float, float]]] = []
 
         for resp_e in responding_electrodes:
             if resp_e == electrode:
-                # Self-electrode: keep Izhikevich times (with floor)
                 mask = elec_arr == resp_e
                 raw_times = step_arr.astype(float)[same_mea][mask] * dt
                 for t_ms in raw_times:
                     out_times.append(max(t_ms, 0.0))
                     out_elecs.append(resp_e)
+                    out_shapes.append(None)
                 continue
 
             profile = self._pathway_profiles.get((electrode, resp_e))
@@ -499,12 +520,18 @@ class SimulatedOrganoid:
                     if t_ms <= window_ms:
                         out_times.append(round(t_ms, 2))
                         out_elecs.append(resp_e)
+                        out_shapes.append((
+                            profile.waveform_widths[path_idx],
+                            profile.waveform_peak_ratios[path_idx],
+                            profile.waveform_asymmetries[path_idx],
+                        ))
 
             if self._rng.rand() < profile.spontaneous_rate:
                 t_ms = float(self._rng.uniform(40.0, 95.0))
                 if t_ms <= window_ms:
                     out_times.append(round(t_ms, 2))
                     out_elecs.append(resp_e)
+                    out_shapes.append(None)
 
         if not out_times:
             return SimulationResult()
@@ -512,6 +539,7 @@ class SimulatedOrganoid:
         return self._extract_results_vectorized(
             np.array(out_times, dtype=float),
             np.array(out_elecs, dtype=int),
+            out_shapes,
         )
 
     # ------------------------------------------------------------------
@@ -522,6 +550,7 @@ class SimulatedOrganoid:
         self,
         time_arr: np.ndarray,
         elec_arr: np.ndarray,
+        shape_params: Optional[List[Optional[Tuple[float, float, float]]]] = None,
     ) -> SimulationResult:
         """Convert raw neuron spikes into electrode-level results (vectorized)."""
         if len(time_arr) == 0:
@@ -537,16 +566,27 @@ class SimulatedOrganoid:
         times_out = np.round(unique_keys[:, 0], 2)
         elecs_out = unique_keys[:, 1].astype(int)
 
-        # Amplitude scales with how many neurons on this electrode fired
-        base_amps = self._rng.uniform(50.0, 300.0, size=n_events)
+        base_amps = self._rng.uniform(80.0, 400.0, size=n_events)
         amp_scale = np.minimum(counts, 5) / 3.0
         amps_out = base_amps * amp_scale
         sign = np.where(self._rng.rand(n_events) < 0.5, -1.0, 1.0)
         amps_out *= sign
         amps_out = np.round(amps_out, 2)
 
-        # Vectorized waveform generation
-        waveforms = self._generate_waveforms_batch(amps_out)
+        # Resolve per-event shape params: pick the first input row that
+        # maps to each unique key (via the inverse mapping).
+        resolved_shapes: List[Optional[Tuple[float, float, float]]] = []
+        if shape_params is not None:
+            first_for_key: Dict[int, int] = {}
+            for src_idx, key_idx in enumerate(inverse):
+                if key_idx not in first_for_key:
+                    first_for_key[key_idx] = src_idx
+            for key_idx in range(n_events):
+                resolved_shapes.append(shape_params[first_for_key[key_idx]])
+        else:
+            resolved_shapes = [None] * n_events
+
+        waveforms = self._generate_waveforms_batch(amps_out, resolved_shapes)
 
         return SimulationResult(
             spike_times_ms=times_out.tolist(),
@@ -555,16 +595,62 @@ class SimulatedOrganoid:
             waveforms=waveforms,
         )
 
-    @staticmethod
-    def _generate_waveforms_batch(peak_uvs: np.ndarray) -> List[List[float]]:
-        """Vectorized biphasic waveform generation for multiple spikes."""
+    def _generate_waveforms_batch(
+        self,
+        peak_uvs: np.ndarray,
+        shape_params: List[Optional[Tuple[float, float, float]]],
+    ) -> List[List[float]]:
+        """Generate realistic biphasic waveforms with per-pathway shape variation and noise.
+
+        Each waveform has:
+        - A negative lobe followed by a positive lobe (biphasic extracellular spike)
+        - Per-pathway shape (width, peak ratio, asymmetry) so different pathways
+          produce recognizably different clusters
+        - Per-trial amplitude jitter (~15%) and width jitter (~8%)
+        - Additive Gaussian noise (~4 uV std) matching real MEA recording floor
+        """
         n = WAVEFORM_N_SAMPLES
-        centre = n // 3
-        width = n / 6.0
-        t = (np.arange(n) - centre) / width                     # (90,)
-        shape = -t * np.exp(-(t * t) / 2.0)                     # (90,)
-        # Outer product: (n_spikes, 90)
-        all_waveforms = peak_uvs[:, None] * shape[None, :]
+        rng = self._rng
+        n_spikes = len(peak_uvs)
+        t_base = np.linspace(-1.0, 2.0, n)  # ms, matching WAVEFORM_DURATION_MS
+
+        all_waveforms = np.empty((n_spikes, n), dtype=np.float64)
+
+        for i in range(n_spikes):
+            sp = shape_params[i]
+            if sp is not None:
+                w_scale, peak_ratio, asym = sp
+            else:
+                w_scale, peak_ratio, asym = 1.0, 0.8, 1.0
+
+            # Per-trial jitter on the pathway's characteristic shape
+            w_trial = w_scale * (1.0 + rng.randn() * 0.08)
+            amp_trial = peak_uvs[i] * (1.0 + rng.randn() * 0.15)
+
+            # Negative lobe: Gaussian centred at t=0 (spike trough)
+            neg_sigma = 0.25 * w_trial
+            neg_lobe = -np.exp(-0.5 * (t_base / neg_sigma) ** 2)
+
+            # Positive lobe: Gaussian shifted rightward, scaled by peak_ratio
+            pos_centre = 0.45 * asym
+            pos_sigma = 0.30 * w_trial
+            pos_lobe = peak_ratio * np.exp(
+                -0.5 * ((t_base - pos_centre) / pos_sigma) ** 2
+            )
+
+            template = neg_lobe + pos_lobe
+            # Normalise so the negative trough is -1
+            trough = np.min(template)
+            if trough != 0.0:
+                template /= -trough
+
+            waveform = amp_trial * template
+
+            # Additive recording noise (~4 uV std)
+            waveform += rng.randn(n) * 4.0
+
+            all_waveforms[i] = waveform
+
         return np.round(all_waveforms, 3).tolist()
 
     # ------------------------------------------------------------------
