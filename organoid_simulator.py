@@ -85,6 +85,10 @@ class PathwayProfile:
         pos_delays     – time from neg trough to pos peak (ms)
         peak_ratios    – positive-peak / negative-trough amplitude ratio
         ahp_amps       – after-hyperpolarization amplitude as fraction of neg
+
+    Amplitude / polarity parameters (per-pathway):
+        signs              – +1.0 or -1.0, fixed extracellular polarity
+        base_amplitudes_uv – characteristic peak amplitude (µV)
     """
 
     latencies_ms: List[float]
@@ -96,6 +100,8 @@ class PathwayProfile:
     pos_delays: List[float] = field(default_factory=list)
     peak_ratios: List[float] = field(default_factory=list)
     ahp_amps: List[float] = field(default_factory=list)
+    signs: List[float] = field(default_factory=list)
+    base_amplitudes_uv: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +333,16 @@ class SimulatedOrganoid:
             pos_d: List[float] = []
             pk_r: List[float] = []
             ahp_a: List[float] = []
+            sgn: List[float] = []
+            b_amp: List[float] = []
             for _ in range(n_paths):
                 neg_w.append(float(rng.uniform(0.12, 0.40)))
                 pos_w.append(float(rng.uniform(0.15, 0.50)))
                 pos_d.append(float(rng.uniform(0.25, 0.80)))
                 pk_r.append(float(rng.uniform(0.3, 1.4)))
                 ahp_a.append(float(rng.uniform(0.0, 0.30)))
+                sgn.append(float(rng.choice([-1.0, 1.0])))
+                b_amp.append(float(rng.uniform(80.0, 400.0)))
 
             profiles[(stim_e, resp_e)] = PathwayProfile(
                 latencies_ms=latencies,
@@ -343,6 +353,8 @@ class SimulatedOrganoid:
                 pos_delays=pos_d,
                 peak_ratios=pk_r,
                 ahp_amps=ahp_a,
+                signs=sgn,
+                base_amplitudes_uv=b_amp,
             )
 
         self._pathway_profiles = profiles
@@ -508,9 +520,9 @@ class SimulatedOrganoid:
         out_times: List[float] = []
         out_elecs: List[int] = []
         # Per-spike waveform shape params:
-        #   (neg_width, pos_width, pos_delay, peak_ratio, ahp_amp)
+        #   (neg_width, pos_width, pos_delay, peak_ratio, ahp_amp, sign, base_amp_uv)
         # None = use default shape (self-electrode / spontaneous spikes).
-        out_shapes: List[Optional[Tuple[float, float, float, float, float]]] = []
+        out_shapes: List[Optional[Tuple[float, float, float, float, float, float, float]]] = []
 
         for resp_e in responding_electrodes:
             if resp_e == electrode:
@@ -542,6 +554,8 @@ class SimulatedOrganoid:
                             profile.pos_delays[path_idx],
                             profile.peak_ratios[path_idx],
                             profile.ahp_amps[path_idx],
+                            profile.signs[path_idx],
+                            profile.base_amplitudes_uv[path_idx],
                         ))
 
             if self._rng.rand() < profile.spontaneous_rate:
@@ -568,7 +582,7 @@ class SimulatedOrganoid:
         self,
         time_arr: np.ndarray,
         elec_arr: np.ndarray,
-        shape_params: Optional[List[Optional[Tuple[float, float, float, float, float]]]] = None,
+        shape_params: Optional[List[Optional[Tuple[float, float, float, float, float, float, float]]]] = None,
     ) -> SimulationResult:
         """Convert raw neuron spikes into electrode-level results (vectorized)."""
         if len(time_arr) == 0:
@@ -584,16 +598,9 @@ class SimulatedOrganoid:
         times_out = np.round(unique_keys[:, 0], 2)
         elecs_out = unique_keys[:, 1].astype(int)
 
-        base_amps = self._rng.uniform(80.0, 400.0, size=n_events)
-        amp_scale = np.minimum(counts, 5) / 3.0
-        amps_out = base_amps * amp_scale
-        sign = np.where(self._rng.rand(n_events) < 0.5, -1.0, 1.0)
-        amps_out *= sign
-        amps_out = np.round(amps_out, 2)
-
         # Resolve per-event shape params: pick the first input row that
         # maps to each unique key (via the inverse mapping).
-        resolved_shapes: List[Optional[Tuple[float, float, float, float, float]]] = []
+        resolved_shapes: List[Optional[Tuple[float, float, float, float, float, float, float]]] = []
         if shape_params is not None:
             first_for_key: Dict[int, int] = {}
             for src_idx, key_idx in enumerate(inverse):
@@ -603,6 +610,21 @@ class SimulatedOrganoid:
                 resolved_shapes.append(shape_params[first_for_key[key_idx]])
         else:
             resolved_shapes = [None] * n_events
+
+        # Build per-event amplitude: use pathway values when available,
+        # fall back to random for self-electrode / spontaneous spikes.
+        amp_scale = np.minimum(counts, 5) / 3.0
+        amps_out = np.empty(n_events, dtype=np.float64)
+        for i in range(n_events):
+            sp = resolved_shapes[i]
+            if sp is not None:
+                sign_i = sp[5]
+                base_amp_i = sp[6]
+            else:
+                sign_i = 1.0 if self._rng.rand() < 0.5 else -1.0
+                base_amp_i = float(self._rng.uniform(80.0, 400.0))
+            amps_out[i] = sign_i * base_amp_i * amp_scale[i]
+        amps_out = np.round(amps_out, 2)
 
         waveforms = self._generate_waveforms_batch(amps_out, resolved_shapes)
 
@@ -616,12 +638,15 @@ class SimulatedOrganoid:
     def _generate_waveforms_batch(
         self,
         peak_uvs: np.ndarray,
-        shape_params: List[Optional[Tuple[float, float, float, float, float]]],
+        shape_params: List[Optional[Tuple[float, float, float, float, float, float, float]]],
     ) -> List[List[float]]:
         """Generate realistic biphasic waveforms with per-pathway shape variation.
 
-        Shape tuple: (neg_width, pos_width, pos_delay, peak_ratio, ahp_amp).
-        Default (spontaneous / same-electrode): (0.25, 0.30, 0.45, 0.8, 0.0).
+        Shape tuple: (neg_width, pos_width, pos_delay, peak_ratio, ahp_amp,
+                       sign, base_amplitude_uv).
+        Default (spontaneous / same-electrode): (0.25, 0.30, 0.45, 0.8, 0.0, *, *).
+        Sign and base_amplitude are already baked into peak_uvs by the caller,
+        so only the first 5 morphology params are used here.
 
         Per-trial jitter is applied to every parameter so repeated spikes
         from the same pathway still show natural variation, while different
@@ -637,7 +662,7 @@ class SimulatedOrganoid:
         for i in range(n_spikes):
             sp = shape_params[i]
             if sp is not None:
-                nw, pw, pd, pr, ahp = sp
+                nw, pw, pd, pr, ahp = sp[0], sp[1], sp[2], sp[3], sp[4]
             else:
                 nw, pw, pd, pr, ahp = 0.25, 0.30, 0.45, 0.8, 0.0
 
